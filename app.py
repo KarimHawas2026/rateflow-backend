@@ -262,8 +262,8 @@ def process_pdfs():
         contract_text = extract_text_from_pdf(contract_file)
 
         contract_response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=16000,
+            model="claude-opus-4-6",
+            max_tokens=32000,
             system=CONTRACT_SYSTEM_PROMPT,
             messages=[
                 {
@@ -286,8 +286,8 @@ def process_pdfs():
             promotion_text = extract_text_from_pdf(promotion_file)
 
             promotion_response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=16000,
+                model="claude-opus-4-6",
+                max_tokens=32000,
                 system=PROMOTION_SYSTEM_PROMPT,
                 messages=[
                     {
