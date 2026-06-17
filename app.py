@@ -250,10 +250,11 @@ EXCEL DATE SERIALS:
 1 Jan 2026 = 46023
 
 IMPORTANT: res_date_from is the date bookings open — typically the contract signing date, NOT the season start date. For the Aloft Al Mina 2026 contract this is 45828.
-
+res_date_till must always be the LAST date of the entire contract validity period — the same value for ALL seasons. Do NOT use the season end date for res_date_till.
 season_type must be exactly: "Low", "Shoulder", or "High"
 Return ONLY raw JSON. Nothing else.
 """
+
 
 PROMOTION_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert. Extract rate data from this hotel promotion PDF.
