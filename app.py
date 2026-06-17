@@ -4,7 +4,6 @@ import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import anthropic
-import openpyxl
 from openpyxl import Workbook
 import PyPDF2
 import io
@@ -20,6 +19,16 @@ def extract_text_from_pdf(pdf_file):
     for page in reader.pages:
         text += page.extract_text() + "\n"
     return text
+
+def clean_json_response(text):
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+    return text.strip()
 
 def generate_excel_from_data(rows, headers):
     wb = Workbook()
@@ -57,19 +66,22 @@ PROMOTION_HEADERS = [
 CONTRACT_SYSTEM_PROMPT = """
 You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-Your job is to read a hotel contract PDF and generate a complete rate sheet in Voyage Tours' exact internal format.
+Your job is to read a hotel contract PDF and generate a complete rate sheet in Voyage Tours exact internal format.
 
 SUPPLEMENT RULES (apply these exactly):
 - Half Board (HB) = BB rate + AED 45 per adult per night
 - Full Board (FB) = BB rate + AED 90 per adult per night
 - 3rd Adult Extra Bed and Breakfast = base rate + AED 75
-- Child (06-11.99) Extra Bed = base rate + AED 50
+- Child (06-11.99) Extra Bed BB = base rate + AED 50
+- Child (06-11.99) Extra Bed HB = base rate + AED 75
+- Child (06-11.99) Extra Bed FB = base rate + AED 110
 - Child (00-05.99) Extra Bed = FREE (same as base rate)
-- Child sharing existing bed = FREE (same as base rate)
-- Child (06-11.99) HB supplement = AED 30 per night
-- Child (06-11.99) FB supplement = AED 60 per night
+- Child (00-05.99) sharing = FREE (same as base rate)
+- Child (06-11.99) sharing BB = same as base rate
+- Child (06-11.99) sharing HB = base rate + AED 30
+- Child (06-11.99) sharing FB = base rate + AED 60
 
-OCCUPANCY COMBINATIONS to generate for each room type, each season, each meal plan:
+OCCUPANCY COMBINATIONS to generate for EACH room type, EACH season, EACH meal plan (BB, HB, FB):
 1ADL
 2ADL
 2ADL+1- ADULT EXTRA BED
@@ -91,19 +103,29 @@ OCCUPANCY COMBINATIONS to generate for each room type, each season, each meal pl
 1ADL+1-CHILD SHARING (00 - 05.99)+1-CHILD SHARING (06 - 11.99)
 
 PRICE CALCULATION RULES:
-- 1ADL and 2ADL = same base rate (SGL/DBL)
-- 3ADL = same as 2ADL+1 ADULT EXTRA BED
-- Children 00-05.99 sharing = no extra charge
-- Children 06-11.99 sharing = no extra charge for BB, add AED 30 for HB, add AED 60 for FB
-- Child extra bed 00-05.99 = no extra charge
-- Child extra bed 06-11.99 = add AED 50 for BB, add AED 75 for HB, add AED 110 for FB
+- 1ADL and 2ADL = same base BB rate
+- 3ADL = same price as 2ADL+1 ADULT EXTRA BED = base + 75
+- Two children 06-11.99 sharing = add 30 HB or 60 FB per child aged 06-11.99
+- Mixed child ages: only add supplement for the 06-11.99 child
 
-DATE SERIAL CONVERSION:
-Convert all dates to Excel serial numbers (days since 1 January 1900).
-Example: 1 May 2026 = 46143, 14 Sep 2026 = 46279, 1 Oct 2026 = 46296, 2 Jan 2027 = 46384
+DATE SERIAL CONVERSION - use these exact values:
+3 Jan 2026 = 46025
+16 Feb 2026 = 46069
+17 Feb 2026 = 46070
+18 Mar 2026 = 46099
+19 Mar 2026 = 46100
+30 Apr 2026 = 46142
+1 May 2026 = 46143
+14 Sep 2026 = 46279
+15 Sep 2026 = 46280
+30 Sep 2026 = 46295
+1 Oct 2026 = 46296
+2 Jan 2027 = 46384
 
-OUTPUT FORMAT:
-Return a JSON object with this exact structure:
+Use reservation date from = first date of contract validity
+Use reservation date till = last date of contract validity
+
+OUTPUT FORMAT - return ONLY this JSON, no markdown, no explanation:
 {
   "hotel_name": "string",
   "rows": [
@@ -133,7 +155,7 @@ Return a JSON object with this exact structure:
 
 Meal values must be exactly: "Bed and Breakfast", "Half Board", "Full Board"
 Season type values must be exactly: "Low", "Shoulder", "High"
-Return ONLY the JSON. No explanation. No markdown. No extra text.
+Return ONLY raw JSON. No markdown code blocks. No explanation. No extra text.
 """
 
 PROMOTION_SYSTEM_PROMPT = """
@@ -141,19 +163,22 @@ You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
 Your job is to read a hotel promotion PDF and generate a complete promotion rate sheet in Voyage Tours exact internal format.
 
-IMPORTANT: Use the FINAL SELLING RATE from the promotion PDF, not the contracted rates.
+IMPORTANT: Use the FINAL SELLING RATE from the promotion PDF as the base rate. Do not use contracted rates.
 
 SUPPLEMENT RULES (apply these exactly):
 - Half Board (HB) = Final Selling Rate + AED 45 per adult per night
 - Full Board (FB) = Final Selling Rate + AED 90 per adult per night
 - 3rd Adult Extra Bed and Breakfast = base rate + AED 75
-- Child (06-11.99) Extra Bed = base rate + AED 50
+- Child (06-11.99) Extra Bed BB = base rate + AED 50
+- Child (06-11.99) Extra Bed HB = base rate + AED 75
+- Child (06-11.99) Extra Bed FB = base rate + AED 110
 - Child (00-05.99) Extra Bed = FREE (same as base rate)
-- Child sharing existing bed = FREE (same as base rate)
-- Child (06-11.99) HB supplement = AED 30 per night
-- Child (06-11.99) FB supplement = AED 60 per night
+- Child (00-05.99) sharing = FREE (same as base rate)
+- Child (06-11.99) sharing BB = same as base rate
+- Child (06-11.99) sharing HB = base rate + AED 30
+- Child (06-11.99) sharing FB = base rate + AED 60
 
-OCCUPANCY COMBINATIONS to generate for each room type, each season, each meal plan:
+OCCUPANCY COMBINATIONS to generate for EACH room type, EACH season, EACH meal plan (BB, HB, FB):
 1ADL
 2ADL
 2ADL+1- ADULT EXTRA BED
@@ -173,12 +198,18 @@ OCCUPANCY COMBINATIONS to generate for each room type, each season, each meal pl
 1ADL+2-CHILD SHARING (06 - 11.99)
 1ADL+1-CHILD SHARING (00 - 05.99)+1-CHILD SHARING (06 - 11.99)
 
-DATE SERIAL CONVERSION:
-Convert all dates to Excel serial numbers.
-Example: 1 June 2026 = 46174, 30 June 2026 = 46203, 14 Sep 2026 = 46279
+DATE SERIAL CONVERSION - use these exact values:
+1 Jun 2026 = 46174
+14 Sep 2026 = 46279
+15 Sep 2026 = 46280
+30 Sep 2026 = 46295
+1 Oct 2026 = 46296
+2 Jan 2027 = 46384
 
-OUTPUT FORMAT:
-Return a JSON object with this exact structure:
+Reservation date from = first booking date from the promotion
+Reservation date till = last booking date from the promotion
+
+OUTPUT FORMAT - return ONLY this JSON, no markdown, no explanation:
 {
   "hotel_name": "string",
   "promo_code": "string",
@@ -216,7 +247,7 @@ Return a JSON object with this exact structure:
   ]
 }
 
-Return ONLY the JSON. No explanation. No markdown. No extra text.
+Return ONLY raw JSON. No markdown code blocks. No explanation. No extra text.
 """
 
 @app.route("/api/process", methods=["POST"])
@@ -241,18 +272,14 @@ def process_pdfs():
                 }
             ]
         )
-response_text = contract_response.content[0].text.strip()
-if response_text.startswith("```"):
-    response_text = response_text.split("```")[1]
-    if response_text.startswith("json"):
-        response_text = response_text[4:]
-contract_data = json.loads(response_text)
+
+        raw_contract = clean_json_response(contract_response.content[0].text)
+        contract_data = json.loads(raw_contract)
         contract_rows = []
         for row in contract_data["rows"]:
             contract_rows.append([row.get(h, "") for h in CONTRACT_HEADERS])
 
         contract_excel = generate_excel_from_data(contract_rows, CONTRACT_HEADERS)
-
         result = {"contract_excel": contract_excel}
 
         if promotion_file:
@@ -265,17 +292,13 @@ contract_data = json.loads(response_text)
                 messages=[
                     {
                         "role": "user",
-                        "content": f"Here is the hotel promotion PDF text. The contract context is also provided for supplement rules.\n\nPROMOTION PDF:\n{promotion_text}\n\nCONTRACT CONTEXT:\n{contract_text}"
+                        "content": f"Here is the hotel promotion PDF text. The contract is also provided for context.\n\nPROMOTION PDF:\n{promotion_text}\n\nCONTRACT CONTEXT:\n{contract_text}"
                     }
                 ]
             )
 
-            response_text = promotion_response.content[0].text.strip()
-if response_text.startswith("```"):
-    response_text = response_text.split("```")[1]
-    if response_text.startswith("json"):
-        response_text = response_text[4:]
-promotion_data = json.loads(response_text)
+            raw_promotion = clean_json_response(promotion_response.content[0].text)
+            promotion_data = json.loads(raw_promotion)
             promotion_rows = []
             for row in promotion_data["rows"]:
                 promotion_rows.append([row.get(h, "") for h in PROMOTION_HEADERS])
@@ -285,6 +308,8 @@ promotion_data = json.loads(response_text)
 
         return jsonify(result)
 
+    except json.JSONDecodeError as e:
+        return jsonify({"error": f"Failed to parse Claude response: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
