@@ -1,0 +1,6 @@
+flask
+flask-cors
+anthropic
+openpyxl
+PyPDF2
+gunicorn
