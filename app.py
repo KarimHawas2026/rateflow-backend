@@ -245,7 +245,11 @@ EXCEL DATE SERIALS:
 2 Jan 2027 = 46384
 1 Jan 2025 = 45658
 1 Jun 2025 = 45808
+19 Jun 2025 = 45826
+21 Jun 2025 = 45828
 1 Jan 2026 = 46023
+
+IMPORTANT: res_date_from is the date bookings open — typically the contract signing date, NOT the season start date. For the Aloft Al Mina 2026 contract this is 45828.
 
 season_type must be exactly: "Low", "Shoulder", or "High"
 Return ONLY raw JSON. Nothing else.
