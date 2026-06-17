@@ -241,8 +241,12 @@ def process_pdfs():
                 }
             ]
         )
-
-        contract_data = json.loads(contract_response.content[0].text)
+response_text = contract_response.content[0].text.strip()
+if response_text.startswith("```"):
+    response_text = response_text.split("```")[1]
+    if response_text.startswith("json"):
+        response_text = response_text[4:]
+contract_data = json.loads(response_text)
         contract_rows = []
         for row in contract_data["rows"]:
             contract_rows.append([row.get(h, "") for h in CONTRACT_HEADERS])
@@ -266,7 +270,12 @@ def process_pdfs():
                 ]
             )
 
-            promotion_data = json.loads(promotion_response.content[0].text)
+            response_text = promotion_response.content[0].text.strip()
+if response_text.startswith("```"):
+    response_text = response_text.split("```")[1]
+    if response_text.startswith("json"):
+        response_text = response_text[4:]
+promotion_data = json.loads(response_text)
             promotion_rows = []
             for row in promotion_data["rows"]:
                 promotion_rows.append([row.get(h, "") for h in PROMOTION_HEADERS])
