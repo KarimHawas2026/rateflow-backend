@@ -65,14 +65,14 @@ PROMOTION_HEADERS = [
     "Staying nights till", "Booking code"
 ]
 
-# Each occupancy has:
-# adults: number of adults
-# adult_extra_beds: number of adult extra beds
-# child_free_sharing: children 00-05.99 sharing (free always)
-# child_paid_sharing: children 06-11.99 sharing (free BB, +30 HB, +60 FB each)
-# child_free_extra: children 00-05.99 extra bed (free always)
-# child_paid_extra: children 06-11.99 extra bed (+50 BB, +50+30 HB, +50+60 FB each)
-# second_paid_child: when 2 children 06-11.99 sharing, second one pays +50 extra bed fee on top
+ALOFT_AL_MINA_SEASONS = [
+    {"season_code": "H", "season_begin": 46025, "season_end": 46069, "season_type": "High"},
+    {"season_code": "S", "season_begin": 46070, "season_end": 46099, "season_type": "Shoulder"},
+    {"season_code": "H", "season_begin": 46100, "season_end": 46142, "season_type": "High"},
+    {"season_code": "L", "season_begin": 46143, "season_end": 46279, "season_type": "Low"},
+    {"season_code": "S", "season_begin": 46280, "season_end": 46295, "season_type": "Shoulder"},
+    {"season_code": "H", "season_begin": 46296, "season_end": 46384, "season_type": "High"},
+]
 
 OCCUPANCY_COMBINATIONS = [
     {"label": "1ADL", "adults": 1, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing": 0, "child_free_extra": 0, "child_paid_extra": 0},
@@ -99,33 +99,23 @@ OCCUPANCY_COMBINATIONS = [
 MEAL_PLANS = ["Bed and Breakfast", "Half Board", "Full Board"]
 
 def calculate_price(base_bb, meal, occ):
-    # Meal supplement per adult per night
     if meal == "Bed and Breakfast":
         adult_meal = 0
         child_paid_meal = 0
     elif meal == "Half Board":
         adult_meal = 45
         child_paid_meal = 30
-    else:  # Full Board
+    else:
         adult_meal = 90
         child_paid_meal = 60
 
     price = base_bb
-
-    # Adult meal supplements (per adult)
     total_adults = occ["adults"] + occ["adult_extra_beds"]
     price += total_adults * adult_meal
-
-    # Adult extra bed fee (always 75 regardless of meal)
     price += occ["adult_extra_beds"] * 75
-
-    # Child 06-11.99 extra bed: +50 always + meal supplement
     price += occ["child_paid_extra"] * (50 + child_paid_meal)
-
-    # Child 06-11.99 sharing: meal supplement only
     price += occ["child_paid_sharing"] * child_paid_meal
 
-    # Second child 06-11.99 sharing pays extra bed fee of 50
     if occ.get("second_paid_child_extra_bed") and occ["child_paid_sharing"] >= 2:
         price += 50
 
@@ -207,54 +197,27 @@ def expand_rates(hotel_name, room_seasons, is_promotion=False, promo_code="", ma
 CONTRACT_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert. Extract rate data from this hotel contract PDF.
 
-IMPORTANT RULES:
-- Extract ONLY the hotel name for the specific property in the contract (e.g. "Aloft Al Mina Hotel" not the combined name)
-- For reservation_date_from use the contract start date as Excel serial
-- For res_date_till per season use the season END date as Excel serial (not contract end date)
-- Extract each room type for each season as a separate entry
-- base_bb is the BB SGL/DBL net rate
+Your job is ONLY to extract:
+1. The hotel name for Aloft Al Mina only
+2. The room types and their BB SGL/DBL rate per season code
 
 Return ONLY this JSON, no markdown, no explanation:
 {
-  "hotel_name": "string",
-  "room_seasons": [
+  "hotel_name": "Aloft Al Mina Hotel",
+  "seasons": [
     {
       "room": "string",
       "base_bb": number,
-      "season_begin": number,
-      "season_end": number,
-      "season_type": "Low or Shoulder or High",
-      "res_date_from": number,
-      "res_date_till": number
+      "season_code": "H or L or S"
     }
   ]
 }
 
-EXCEL DATE SERIALS:
-3 Jan 2026 = 46025
-16 Feb 2026 = 46069
-17 Feb 2026 = 46070
-18 Mar 2026 = 46099
-19 Mar 2026 = 46100
-30 Apr 2026 = 46142
-1 May 2026 = 46143
-14 Sep 2026 = 46279
-15 Sep 2026 = 46280
-30 Sep 2026 = 46295
-1 Oct 2026 = 46296
-2 Jan 2027 = 46384
-1 Jan 2025 = 45658
-1 Jun 2025 = 45808
-19 Jun 2025 = 45826
-21 Jun 2025 = 45828
-1 Jan 2026 = 46023
-
-IMPORTANT: res_date_from is the date bookings open — typically the contract signing date, NOT the season start date. For the Aloft Al Mina 2026 contract this is 45828.
-res_date_till must always be the LAST date of the entire contract validity period — the same value for ALL seasons. Do NOT use the season end date for res_date_till.
-season_type must be exactly: "Low", "Shoulder", or "High"
+Extract one entry per room type per season code.
+Season codes: H = High, L = Low, S = Shoulder.
+base_bb is the BB SGL/DBL net rate.
 Return ONLY raw JSON. Nothing else.
 """
-
 
 PROMOTION_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert. Extract rate data from this hotel promotion PDF.
@@ -319,9 +282,23 @@ def process_pdfs():
         raw_contract = clean_json_response(contract_response.content[0].text)
         contract_data = json.loads(raw_contract)
 
+        room_seasons = []
+        for season_entry in contract_data["seasons"]:
+            for s in ALOFT_AL_MINA_SEASONS:
+                if s["season_code"] == season_entry["season_code"]:
+                    room_seasons.append({
+                        "room": season_entry["room"],
+                        "base_bb": season_entry["base_bb"],
+                        "season_begin": s["season_begin"],
+                        "season_end": s["season_end"],
+                        "season_type": s["season_type"],
+                        "res_date_from": 45828,
+                        "res_date_till": 46384
+                    })
+
         contract_rows = expand_rates(
             hotel_name=contract_data["hotel_name"],
-            room_seasons=contract_data["room_seasons"],
+            room_seasons=room_seasons,
             is_promotion=False
         )
 
