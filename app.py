@@ -21,6 +21,16 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 app = FastAPI(title="Hotel Rate Sheet Processor")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development; restrict to your Lovable domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # -------------------- Pydantic Schemas --------------------
 class RateRow(BaseModel):
     hotel: str
