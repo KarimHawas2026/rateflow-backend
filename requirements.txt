@@ -1,6 +1,6 @@
-flask
-flask-cors
-anthropic
-openpyxl
-PyPDF2
-gunicorn
+fastapi==0.110.0
+uvicorn==0.27.0
+anthropic==0.23.1
+openpyxl==3.1.2
+pydantic==2.5.0
+python-multipart==0.0.9
