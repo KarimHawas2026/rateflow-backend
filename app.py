@@ -1,11 +1,12 @@
 import os
-import json
 import io
 import base64
 import zipfile
 from typing import Optional
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import Request
 import anthropic
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -21,8 +22,7 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 app = FastAPI(title="Hotel Rate Sheet Processor")
 
-from fastapi.middleware.cors import CORSMiddleware
-
+# -------------------- CORS (allow Lovable to call this API) --------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # For development; restrict to your Lovable domain in production
@@ -207,12 +207,13 @@ def create_promotion_excel(rows: list[SPORow]) -> io.BytesIO:
     out.seek(0)
     return out
 
-# -------------------- Endpoint --------------------
+# -------------------- Main Endpoint --------------------
 @app.post("/process")
 async def process_rates(
     contract: UploadFile = File(...),
     promotion: Optional[UploadFile] = File(None)
 ):
+    """Accept contract PDF and optional promotion PDF. Return ZIP with Excel sheets."""
     if not contract.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Contract file must be PDF")
     if promotion and not promotion.filename.endswith('.pdf'):
@@ -299,24 +300,32 @@ async def process_rates(
         headers={"Content-Disposition": "attachment; filename=rate_sheets.zip"}
     )
 
+# -------------------- Helper Routes --------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+@app.get("/")
+async def root():
+    return {"message": "RateFlow backend is running. Use POST /process to upload PDFs."}
 
 @app.get("/process")
 async def process_get():
-    return {"message": "Use POST to upload PDFs."}
+    return {"message": "This endpoint requires a POST request with PDF files."}
 
-from fastapi import Request
-
+# Catch‑all route to help debug wrong frontend paths
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def catch_all(request: Request, path: str):
-    return {
-        "message": f"Request received at path /{path}",
-        "method": request.method,
-        "full_url": str(request.url),
-        "note": "This endpoint is not implemented. Check your frontend URL."
-    }
+    return JSONResponse(
+        status_code=404,
+        content={
+            "message": f"Request received at path /{path}",
+            "method": request.method,
+            "full_url": str(request.url),
+            "note": "This endpoint is not implemented. Check your frontend URL."
+        }
+    )
+
+# -------------------- Run --------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8080)
