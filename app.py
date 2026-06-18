@@ -305,3 +305,7 @@ async def health():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
+
+@app.get("/process")
+async def process_get():
+    return {"message": "Use POST to upload PDFs."}
