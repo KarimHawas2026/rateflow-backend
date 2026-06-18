@@ -253,7 +253,7 @@ async def process_pdfs(contract: UploadFile, promotion: Optional[UploadFile] = N
 
     try:
         response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-sonnet-4-6",
             max_tokens=8192,
             system=SYSTEM_PROMPT,
             messages=messages,
