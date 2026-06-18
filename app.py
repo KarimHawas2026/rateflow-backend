@@ -248,11 +248,99 @@ async def process_pdfs(contract: UploadFile, promotion: Optional[UploadFile] = N
     })
 
     tool_schema = {
-        "name": "output_rate_sheet",
-        "description": "Output the extracted and expanded rate sheets",
-        "input_schema": OutputSchema.model_json_schema(),
-        "strict": True
-    }
+    "name": "output_rate_sheet",
+    "description": "Output the extracted and expanded rate sheets",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "contract_rates": {
+                "type": "array",
+                "description": "List of contract rates",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "hotel": {"type": "string"},
+                        "room": {"type": "string"},
+                        "accommodation": {"type": "string"},
+                        "meal": {"type": "string"},
+                        "season_begin": {"type": "string"},
+                        "season_end": {"type": "string"},
+                        "reservation_date_from": {"type": "string"},
+                        "reservation_date_till": {"type": "string"},
+                        "nights": {"type": "integer"},
+                        "hotel_net_price": {"type": "number"},
+                        "number_of_markups": {"type": "integer"},
+                        "currency_code": {"type": "string"},
+                        "currency": {"type": "string"},
+                        "season_type": {"type": "string"},
+                        "market_code": {"type": "string"},
+                        "price_type": {"type": "string"},
+                        "staying_nights_from": {"type": "integer"},
+                        "staying_nights_till": {"type": "integer"},
+                        "booking_code": {"type": "string"}
+                    },
+                    "required": [
+                        "hotel", "room", "accommodation", "meal", "season_begin", 
+                        "season_end", "reservation_date_from", "reservation_date_till", 
+                        "nights", "hotel_net_price", "number_of_markups", 
+                        "currency_code", "currency", "season_type", "market_code", 
+                        "price_type", "staying_nights_from", "staying_nights_till"
+                    ],
+                    "additionalProperties": False
+                }
+            },
+            "promotion_rates": {
+                "type": "array",
+                "description": "List of promotion rates",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "spo_no": {"type": "string"},
+                        "price_type": {"type": "string"},
+                        "hotel": {"type": "string"},
+                        "room": {"type": "string"},
+                        "accommodation": {"type": "string"},
+                        "meal": {"type": "string"},
+                        "hotel_net_price": {"type": "number"},
+                        "currency_code": {"type": "string"},
+                        "market_code": {"type": "string"},
+                        "season_begin": {"type": "string"},
+                        "season_end": {"type": "string"},
+                        "days_before_checkin_from": {"type": "integer"},
+                        "reservation_date_from": {"type": "string"},
+                        "reservation_date_till": {"type": "string"},
+                        "check_in_from": {"type": "string"},
+                        "check_in_till": {"type": "string"},
+                        "check_out_from": {"type": "string"},
+                        "staying_nights_from": {"type": "integer"},
+                        "check_out_till": {"type": "string"},
+                        "nights": {"type": "integer"},
+                        "nights_from": {"type": "integer"},
+                        "nights_till": {"type": "integer"},
+                        "number_of_markups": {"type": "integer"},
+                        "nights_free": {"type": "integer"},
+                        "season_type": {"type": "string"},
+                        "days_before_checkin_till": {"type": "integer"},
+                        "staying_nights_till": {"type": "integer"},
+                        "booking_code": {"type": "string"}
+                    },
+                    "required": [
+                        "spo_no", "price_type", "hotel", "room", "accommodation", 
+                        "meal", "hotel_net_price", "currency_code", "market_code", 
+                        "season_begin", "season_end", "reservation_date_from", 
+                        "reservation_date_till", "check_in_from", "check_in_till", 
+                        "staying_nights_from", "nights", "number_of_markups", 
+                        "season_type", "staying_nights_till", "booking_code"
+                    ],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["contract_rates", "promotion_rates"],
+        "additionalProperties": False   # <-- THIS WAS MISSING
+    },
+    "strict": True
+}
 
     try:
         response = client.messages.create(
