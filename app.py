@@ -259,7 +259,7 @@ async def process_pdfs(contract: UploadFile, promotion: Optional[UploadFile] = N
             system=SYSTEM_PROMPT,
             messages=messages,
             tools=[tool_schema],
-            tool_choice={"type": "any"}
+            tool_choice={"type": "tool", "name": "output_rate_sheet"},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Claude API error: {str(e)}")
