@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import base64
 import zipfile
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -102,7 +103,6 @@ def create_contract_excel(rows: list[RateRow]) -> io.BytesIO:
     ws = wb.active
     ws.title = "Contract Rates"
 
-    # Headers
     headers = ["Hotel", "Room", "Accommodation", "Meal", "Season begin", "Season end",
                "Reservation date from", "Reservation date till", "Nights", "Hotel net price",
                "Number of markups", "Currency (code)", "Currency", "Season type",
@@ -110,13 +110,11 @@ def create_contract_excel(rows: list[RateRow]) -> io.BytesIO:
                "Booking code"]
     ws.append(headers)
 
-    # Style headers
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
         cell.alignment = Alignment(horizontal="center")
 
-    # Data rows
     for r in rows:
         ws.append([
             r.hotel, r.room, r.accommodation, r.meal,
@@ -129,7 +127,6 @@ def create_contract_excel(rows: list[RateRow]) -> io.BytesIO:
             r.booking_code or ""
         ])
 
-    # Auto-fit columns (basic)
     for col in ws.columns:
         max_length = 0
         column = col[0].column_letter
@@ -206,19 +203,14 @@ async def process_rates(
     contract: UploadFile = File(...),
     promotion: Optional[UploadFile] = File(None)
 ):
-    """
-    Accept contract PDF and optional promotion PDF.
-    Returns a ZIP file containing both Excel outputs.
-    """
-    # Validate file types
     if not contract.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Contract file must be PDF")
     if promotion and not promotion.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Promotion file must be PDF")
 
-    # Read PDFs into base64 for Claude
+    # Read PDFs and encode as base64
     contract_bytes = await contract.read()
-    contract_b64 = anthropic.util.base64_encode(contract_bytes)
+    contract_b64 = base64.b64encode(contract_bytes).decode("utf-8")
 
     messages = [
         {
@@ -236,10 +228,9 @@ async def process_rates(
         }
     ]
 
-    # Add promotion document if provided
     if promotion:
         promo_bytes = await promotion.read()
-        promo_b64 = anthropic.util.base64_encode(promo_bytes)
+        promo_b64 = base64.b64encode(promo_bytes).decode("utf-8")
         messages[0]["content"].append({
             "type": "document",
             "source": {
@@ -249,14 +240,11 @@ async def process_rates(
             }
         })
 
-    # Add text instruction
     messages[0]["content"].append({
         "type": "text",
         "text": "Extract all rates, supplements, and promotions. Output the JSON exactly matching the provided schemas. Include both contract and promotion rates in the response."
     })
 
-    # Call Claude with tool/function calling for structured output
-    # We'll use the new "tools" parameter with a JSON schema.
     tool_schema = {
         "name": "output_rate_sheet",
         "description": "Output the extracted and expanded rate sheets",
@@ -275,22 +263,18 @@ async def process_rates(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Claude API error: {str(e)}")
 
-    # Parse tool output
     try:
         tool_output = response.content[0]
         if tool_output.type != "tool_use":
             raise ValueError("Claude did not use the tool")
         raw_json = tool_output.input
-        # Validate with Pydantic
         output = OutputSchema(**raw_json)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse Claude output: {str(e)}")
 
-    # Generate Excel files
     contract_excel = create_contract_excel(output.contract_rates)
     promo_excel = create_promotion_excel(output.promotion_rates) if output.promotion_rates else None
 
-    # Create ZIP in memory
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr("Contract_Rates.xlsx", contract_excel.getvalue())
@@ -305,11 +289,9 @@ async def process_rates(
         headers={"Content-Disposition": "attachment; filename=rate_sheets.zip"}
     )
 
-# -------------------- Health Check --------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# -------------------- Run --------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
