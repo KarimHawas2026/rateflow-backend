@@ -309,3 +309,14 @@ if __name__ == "__main__":
 @app.get("/process")
 async def process_get():
     return {"message": "Use POST to upload PDFs."}
+
+from fastapi import Request
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def catch_all(request: Request, path: str):
+    return {
+        "message": f"Request received at path /{path}",
+        "method": request.method,
+        "full_url": str(request.url),
+        "note": "This endpoint is not implemented. Check your frontend URL."
+    }
