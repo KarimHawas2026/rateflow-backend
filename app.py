@@ -105,7 +105,8 @@ Your task is to extract all rates, rules, and supplements, then expand them into
 **Important:** Do not invent rates. If a value is not stated, set it to null or 0. Include a "warnings" array in the JSON if any ambiguities exist.
 
 Now process the uploaded files.
-You MUST use the output_rate_sheet tool to return your response. Do NOT respond with plain text."""
+You MUST use the output_rate_sheet tool to return your response. Do NOT respond with plain text.
+You MUST use the output_rate_sheet tool to return your response. Always call the tool before responding. Do NOT respond with plain text."""
 
 # -------------------- Excel generation helpers --------------------
 def create_contract_excel_bytes(rows: list[RateRow]) -> bytes:
@@ -249,7 +250,8 @@ async def process_pdfs(contract: UploadFile, promotion: Optional[UploadFile] = N
     tool_schema = {
         "name": "output_rate_sheet",
         "description": "Output the extracted and expanded rate sheets",
-        "input_schema": OutputSchema.model_json_schema()
+        "input_schema": OutputSchema.model_json_schema(),
+        "strict": True
     }
 
     try:
