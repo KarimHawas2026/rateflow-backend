@@ -1,449 +1,457 @@
 import os
-import io
+import json
 import base64
-import zipfile
-from typing import Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import anthropic
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
-from pydantic import BaseModel
-import uvicorn
+from openpyxl import Workbook
+import PyPDF2
+import io
+from datetime import datetime, timedelta
 
-# -------------------- Configuration --------------------
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+app = Flask(__name__)
+CORS(app, origins="*")
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-app = FastAPI(title="Hotel Rate Sheet Processor")
+# ─────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────
 
-# -------------------- CORS (allow Lovable) --------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def extract_text_from_pdf(pdf_file):
+    reader = PyPDF2.PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
 
-# -------------------- Pydantic Schemas (for Claude output) --------------------
-class RateRow(BaseModel):
-    hotel: str
-    room: str
-    accommodation: str
-    meal: str
-    season_begin: str
-    season_end: str
-    reservation_date_from: str
-    reservation_date_till: str
-    nights: int
-    hotel_net_price: float
-    number_of_markups: int
-    currency_code: str
-    currency: str
-    season_type: str
-    market_code: str
-    price_type: str
-    staying_nights_from: int
-    staying_nights_till: int
-    booking_code: Optional[str] = ""
+def clean_json_response(text):
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{") or part.startswith("["):
+                return part.strip()
+    return text.strip()
 
-class SPORow(BaseModel):
-    spo_no: str
-    price_type: str
-    hotel: str
-    room: str
-    accommodation: str
-    meal: str
-    hotel_net_price: float
-    currency_code: str
-    market_code: str
-    season_begin: str
-    season_end: str
-    days_before_checkin_from: Optional[int] = None
-    reservation_date_from: str
-    reservation_date_till: str
-    check_in_from: str
-    check_in_till: str
-    check_out_from: Optional[str] = None
-    staying_nights_from: int
-    check_out_till: Optional[str] = None
-    nights: int
-    nights_from: Optional[int] = None
-    nights_till: Optional[int] = None
-    number_of_markups: int
-    nights_free: Optional[int] = None
-    season_type: str
-    days_before_checkin_till: Optional[int] = None
-    staying_nights_till: int
-    booking_code: str
+def date_to_excel_serial(date_str):
+    """Convert DD/MM/YYYY string to Excel serial number."""
+    try:
+        d = datetime.strptime(date_str.strip(), "%d/%m/%Y")
+        return (d - datetime(1899, 12, 30)).days
+    except:
+        return 0
 
-class OutputSchema(BaseModel):
-    contract_rates: list[RateRow]
-    promotion_rates: list[SPORow]
-
-# -------------------- System Prompt --------------------
-SYSTEM_PROMPT = """You are a Hotel Rate Standardisation Expert. You will receive two PDFs: a signed contract and an optional promotional rate sheet.
-
-Your task is to extract all rates, rules, and supplements, then expand them into the structured JSON schemas provided.
-
-**Rules:**
-- Use the contract PDF as the source for base rates per room per season, extra bed/3rd adult charges, child policies, and meal supplements (HB, FB, AI) per season.
-- If a promotion PDF is provided, extract its discount percentages, applicable stay/booking windows, promotional meal supplements (which override contract meal supplements for the promotion period), and promo code.
-- For each valid occupancy combination (based on max occupancy rules), generate a rate row for each meal type (BB, HB, FB, AI where applicable).
-- For the contract: use contract meal supplements and no discounts.
-- For the promotion: apply discount only to the accommodation portion (base rate + extra bed charges). Meal supplements are NOT discounted and use promotion-specific supplement rates.
-- Expand all possible occupancy combinations: 1ADL, 2ADL, 2ADL+1-ADULT EXTRA BED, 2ADL+1-CHILD SHARING (00-05.99), 2ADL+1-CHILD SHARING (06-11.99), 2ADL+1-CHILD EXTRA BED (00-05.99), 2ADL+1-CHILD EXTRA BED (06-11.99), 2ADL+1-CHILD SHARING (00-05.99)+1-CHILD SHARING (06-11.99), 2ADL+2-CHILD SHARING (00-05.99), 2ADL+2-CHILD SHARING (06-11.99), 1ADL+1-CHILD SHARING (00-05.99), etc. Include all valid combos per contract's max occupancy.
-- For each row, output numeric fields as floats, dates as strings in YYYY-MM-DD format.
-
-**Output format:** You MUST output a valid JSON object that matches the provided Pydantic schemas exactly.
-
-**Important:** Do not invent rates. If a value is not stated, set it to null or 0. Include a "warnings" array in the JSON if any ambiguities exist.
-
-Now process the uploaded files.
-You MUST use the output_rate_sheet tool to return your response. Do NOT respond with plain text.
-You MUST use the output_rate_sheet tool to return your response. Always call the tool before responding. Do NOT respond with plain text."""
-
-# -------------------- Excel generation helpers --------------------
-def create_contract_excel_bytes(rows: list[RateRow]) -> bytes:
-    wb = openpyxl.Workbook()
+def generate_excel_from_data(rows, headers):
+    wb = Workbook()
     ws = wb.active
-    ws.title = "Contract Rates"
-
-    headers = ["Hotel", "Room", "Accommodation", "Meal", "Season begin", "Season end",
-               "Reservation date from", "Reservation date till", "Nights", "Hotel net price",
-               "Number of markups", "Currency (code)", "Currency", "Season type",
-               "Market code", "Price type", "Staying nights from", "Staying nights till",
-               "Booking code"]
     ws.append(headers)
+    for row in rows:
+        ws.append(row)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
+# ─────────────────────────────────────────────
+# HEADERS
+# ─────────────────────────────────────────────
 
-    for r in rows:
-        ws.append([
-            r.hotel, r.room, r.accommodation, r.meal,
-            r.season_begin, r.season_end,
-            r.reservation_date_from, r.reservation_date_till,
-            r.nights, r.hotel_net_price,
-            r.number_of_markups, r.currency_code, r.currency,
-            r.season_type, r.market_code, r.price_type,
-            r.staying_nights_from, r.staying_nights_till,
-            r.booking_code or ""
-        ])
+CONTRACT_HEADERS = [
+    "Hotel", "Room", "Accommodation", "Meal",
+    "Season begin", "Season end",
+    "Reservation date from", "Reservation date till",
+    "Nights", "Hotel net price", "Number of markups",
+    "Currency (code)", "Currency", "Season type",
+    "Market code", "Price type",
+    "Staying nights from", "Staying nights till", "Booking code"
+]
 
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-        adjusted_width = min(max_length + 2, 30)
-        ws.column_dimensions[column].width = adjusted_width
+PROMOTION_HEADERS = [
+    "SPO No", "Price type", "Hotel", "Room", "Accommodation", "Meal",
+    "Hotel net price", "Currency (code)", "Market code",
+    "Season begin", "Season end",
+    "Days before check-in from", "Reservation date from", "Reservation date till",
+    "Check-in from", "Check-in till", "Check-out from",
+    "Staying nights from", "Check-out till", "Nights",
+    "Nights from", "Nights till", "Number of markups",
+    "Nights free", "Season type", "Days before check-in till",
+    "Staying nights till", "Booking code"
+]
 
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.getvalue()
+# ─────────────────────────────────────────────
+# CLAUDE PROMPTS
+# ─────────────────────────────────────────────
 
-def create_promotion_excel_bytes(rows: list[SPORow]) -> bytes:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Promotion Rates"
+CONTRACT_EXTRACTION_PROMPT = """
+You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-    headers = ["SPO No", "Price type", "Hotel", "Room", "Accommodation", "Meal",
-               "Hotel net price", "Currency (code)", "Market code", "Season begin",
-               "Season end", "Days before check-in from", "Reservation date from",
-               "Reservation date till", "Check-in from", "Check-in till",
-               "Check-out from", "Staying nights from", "Check-out till",
-               "Nights", "Nights from", "Nights till", "Number of markups",
-               "Nights free", "Season type", "Days before check-in till",
-               "Staying nights till", "Booking code"]
-    ws.append(headers)
+Your job is to read a hotel contract PDF and extract ALL rate data needed to build a complete rate sheet.
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
+You must extract:
+1. Hotel name
+2. Contract validity dates (reservation_date_from and reservation_date_till)
+3. For each room type and each season period: the BB SGL/DBL base rate
+4. The supplement rules specific to this hotel (meal plan supplements per person, extra bed charges, child policy)
+5. All available meal plans (Room Only, BB, HB, FB, etc.)
+6. All valid occupancy combinations used by this hotel
 
-    for r in rows:
-        ws.append([
-            r.spo_no, r.price_type, r.hotel, r.room, r.accommodation, r.meal,
-            r.hotel_net_price, r.currency_code, r.market_code,
-            r.season_begin, r.season_end,
-            r.days_before_checkin_from,
-            r.reservation_date_from, r.reservation_date_till,
-            r.check_in_from, r.check_in_till,
-            r.check_out_from, r.staying_nights_from,
-            r.check_out_till, r.nights,
-            r.nights_from, r.nights_till,
-            r.number_of_markups, r.nights_free,
-            r.season_type, r.days_before_checkin_till,
-            r.staying_nights_till, r.booking_code
-        ])
-
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-        adjusted_width = min(max_length + 2, 30)
-        ws.column_dimensions[column].width = adjusted_width
-
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-# -------------------- Core processing function --------------------
-async def process_pdfs(contract: UploadFile, promotion: Optional[UploadFile] = None):
-    """Core logic: call Claude, parse output, generate Excel bytes."""
-    contract_bytes = await contract.read()
-    contract_b64 = base64.b64encode(contract_bytes).decode("utf-8")
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": contract_b64
-                    }
-                }
-            ]
-        }
-    ]
-
-    if promotion:
-        promo_bytes = await promotion.read()
-        promo_b64 = base64.b64encode(promo_bytes).decode("utf-8")
-        messages[0]["content"].append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": promo_b64
-            }
-        })
-
-    messages[0]["content"].append({
-        "type": "text",
-        "text": "Extract all rates, supplements, and promotions. Output the JSON exactly matching the provided schemas. Include both contract and promotion rates in the response."
-    })
-
-    tool_schema = {
-    "name": "output_rate_sheet",
-    "description": "Output the extracted and expanded rate sheets",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "contract_rates": {
-                "type": "array",
-                "description": "List of contract rates",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "hotel": {"type": "string"},
-                        "room": {"type": "string"},
-                        "accommodation": {"type": "string"},
-                        "meal": {"type": "string"},
-                        "season_begin": {"type": "string"},
-                        "season_end": {"type": "string"},
-                        "reservation_date_from": {"type": "string"},
-                        "reservation_date_till": {"type": "string"},
-                        "nights": {"type": "integer"},
-                        "hotel_net_price": {"type": "number"},
-                        "number_of_markups": {"type": "integer"},
-                        "currency_code": {"type": "string"},
-                        "currency": {"type": "string"},
-                        "season_type": {"type": "string"},
-                        "market_code": {"type": "string"},
-                        "price_type": {"type": "string"},
-                        "staying_nights_from": {"type": "integer"},
-                        "staying_nights_till": {"type": "integer"},
-                        "booking_code": {"type": "string"}
-                    },
-                    "required": [
-                        "hotel", "room", "accommodation", "meal", "season_begin", 
-                        "season_end", "reservation_date_from", "reservation_date_till", 
-                        "nights", "hotel_net_price", "number_of_markups", 
-                        "currency_code", "currency", "season_type", "market_code", 
-                        "price_type", "staying_nights_from", "staying_nights_till"
-                    ],
-                    "additionalProperties": False
-                }
-            },
-            "promotion_rates": {
-                "type": "array",
-                "description": "List of promotion rates",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "spo_no": {"type": "string"},
-                        "price_type": {"type": "string"},
-                        "hotel": {"type": "string"},
-                        "room": {"type": "string"},
-                        "accommodation": {"type": "string"},
-                        "meal": {"type": "string"},
-                        "hotel_net_price": {"type": "number"},
-                        "currency_code": {"type": "string"},
-                        "market_code": {"type": "string"},
-                        "season_begin": {"type": "string"},
-                        "season_end": {"type": "string"},
-                        "days_before_checkin_from": {"type": "integer"},
-                        "reservation_date_from": {"type": "string"},
-                        "reservation_date_till": {"type": "string"},
-                        "check_in_from": {"type": "string"},
-                        "check_in_till": {"type": "string"},
-                        "check_out_from": {"type": "string"},
-                        "staying_nights_from": {"type": "integer"},
-                        "check_out_till": {"type": "string"},
-                        "nights": {"type": "integer"},
-                        "nights_from": {"type": "integer"},
-                        "nights_till": {"type": "integer"},
-                        "number_of_markups": {"type": "integer"},
-                        "nights_free": {"type": "integer"},
-                        "season_type": {"type": "string"},
-                        "days_before_checkin_till": {"type": "integer"},
-                        "staying_nights_till": {"type": "integer"},
-                        "booking_code": {"type": "string"}
-                    },
-                    "required": [
-                        "spo_no", "price_type", "hotel", "room", "accommodation", 
-                        "meal", "hotel_net_price", "currency_code", "market_code", 
-                        "season_begin", "season_end", "reservation_date_from", 
-                        "reservation_date_till", "check_in_from", "check_in_till", 
-                        "staying_nights_from", "nights", "number_of_markups", 
-                        "season_type", "staying_nights_till", "booking_code"
-                    ],
-                    "additionalProperties": False
-                }
-            }
-        },
-        "required": ["contract_rates", "promotion_rates"],
-        "additionalProperties": False   # <-- THIS WAS MISSING
-    },
-    "strict": True
+Return ONLY this JSON structure, no markdown, no explanation:
+{
+  "hotel_name": "string",
+  "reservation_date_from": "DD/MM/YYYY",
+  "reservation_date_till": "DD/MM/YYYY",
+  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board", "Full Board"],
+  "supplement_rules": {
+    "hb_per_adult": number,
+    "fb_per_adult": number,
+    "extra_bed_adult": number,
+    "extra_bed_child_under_6": number,
+    "extra_bed_child_6_to_12": number,
+    "child_meal_hb_under_6": number,
+    "child_meal_hb_6_to_12": number,
+    "child_meal_fb_under_6": number,
+    "child_meal_fb_6_to_12": number
+  },
+  "room_seasons": [
+    {
+      "room": "string",
+      "base_bb": number,
+      "season_begin": "DD/MM/YYYY",
+      "season_end": "DD/MM/YYYY",
+      "season_type": "Low or Shoulder or High",
+      "res_date_from": "DD/MM/YYYY",
+      "res_date_till": "DD/MM/YYYY"
+    }
+  ],
+  "occupancy_combinations": [
+    {
+      "label": "string",
+      "adults": number,
+      "adult_extra_beds": number,
+      "child_free_sharing": number,
+      "child_paid_sharing_under_6": number,
+      "child_paid_sharing_6_to_12": number,
+      "child_free_extra": number,
+      "child_paid_extra_under_6": number,
+      "child_paid_extra_6_to_12": number
+    }
+  ]
 }
 
+IMPORTANT RULES:
+- All dates must be in DD/MM/YYYY format
+- res_date_from per season = contract signing date or opening booking date
+- res_date_till per season = that season's end date
+- reservation_date_from = overall contract start (when bookings open)
+- reservation_date_till = overall contract end date
+- season_type must be exactly: "Low", "Shoulder", or "High"
+- If the hotel only has BB (no Room Only), do not include Room Only in meal_plans
+- Extract supplement rules exactly as stated in the contract
+- If a supplement is "free" set it to 0
+- Return ONLY raw JSON. Nothing else.
+"""
+
+PROMOTION_EXTRACTION_PROMPT = """
+You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
+
+Your job is to read a hotel promotion/SPO PDF and extract ALL rate data needed to build a complete promotion rate sheet.
+
+CRITICAL: Use the FINAL SELLING RATE or PROMO RATE as base rate. Never use contracted rates.
+
+Return ONLY this JSON structure, no markdown, no explanation:
+{
+  "hotel_name": "string",
+  "promo_code": "string",
+  "reservation_date_from": "DD/MM/YYYY",
+  "reservation_date_till": "DD/MM/YYYY",
+  "mlos": number,
+  "mlos_till": number,
+  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board"],
+  "supplement_rules": {
+    "hb_per_adult": number,
+    "fb_per_adult": number,
+    "extra_bed_adult": number,
+    "extra_bed_child_under_6": number,
+    "extra_bed_child_6_to_12": number,
+    "child_meal_hb_under_6": number,
+    "child_meal_hb_6_to_12": number,
+    "child_meal_fb_under_6": number,
+    "child_meal_fb_6_to_12": number
+  },
+  "room_seasons": [
+    {
+      "room": "string",
+      "base_rate": number,
+      "meal_plan": "string",
+      "season_begin": "DD/MM/YYYY",
+      "season_end": "DD/MM/YYYY",
+      "season_type": "Low or Shoulder or High",
+      "res_date_from": "DD/MM/YYYY",
+      "res_date_till": "DD/MM/YYYY"
+    }
+  ],
+  "occupancy_combinations": [
+    {
+      "label": "string",
+      "adults": number,
+      "adult_extra_beds": number,
+      "child_free_sharing": number,
+      "child_paid_sharing_under_6": number,
+      "child_paid_sharing_6_to_12": number,
+      "child_free_extra": number,
+      "child_paid_extra_under_6": number,
+      "child_paid_extra_6_to_12": number
+    }
+  ]
+}
+
+IMPORTANT RULES:
+- All dates must be in DD/MM/YYYY format
+- mlos = minimum length of stay (default 1 if not stated)
+- mlos_till = maximum length of stay (default 366 if not stated)
+- base_rate is the PROMO/FINAL SELLING RATE for that room and meal plan
+- meal_plan per room_season is the base meal plan of the promo rate
+- season_type must be exactly: "Low", "Shoulder", or "High"
+- Extract supplement rules exactly as stated in the promotion PDF
+- Return ONLY raw JSON. Nothing else.
+"""
+
+# ─────────────────────────────────────────────
+# PRICE CALCULATION
+# ─────────────────────────────────────────────
+
+def calculate_price(base_bb, meal, occ, rules):
+    """
+    Calculate price for any occupancy and meal plan
+    using supplement rules extracted from the PDF.
+    """
+    hb = rules.get("hb_per_adult", 45)
+    fb = rules.get("fb_per_adult", 90)
+    extra_bed_adult = rules.get("extra_bed_adult", 75)
+    extra_bed_child_u6 = rules.get("extra_bed_child_under_6", 0)
+    extra_bed_child_6 = rules.get("extra_bed_child_6_to_12", 50)
+    child_hb_u6 = rules.get("child_meal_hb_under_6", 0)
+    child_hb_6 = rules.get("child_meal_hb_6_to_12", 30)
+    child_fb_u6 = rules.get("child_meal_fb_under_6", 0)
+    child_fb_6 = rules.get("child_meal_fb_6_to_12", 60)
+
+    if meal in ["Room Only", "RO"]:
+        adult_meal = 0
+        child_meal_u6 = 0
+        child_meal_6 = 0
+    elif meal in ["Bed and Breakfast", "BB"]:
+        adult_meal = 0
+        child_meal_u6 = 0
+        child_meal_6 = 0
+    elif meal in ["Half Board", "HB"]:
+        adult_meal = hb
+        child_meal_u6 = child_hb_u6
+        child_meal_6 = child_hb_6
+    elif meal in ["Full Board", "FB"]:
+        adult_meal = fb
+        child_meal_u6 = child_fb_u6
+        child_meal_6 = child_fb_6
+    else:
+        adult_meal = 0
+        child_meal_u6 = 0
+        child_meal_6 = 0
+
+    price = base_bb
+
+    # Adult meal supplements
+    total_adults = occ["adults"] + occ["adult_extra_beds"]
+    price += total_adults * adult_meal
+
+    # Adult extra bed fee
+    price += occ["adult_extra_beds"] * extra_bed_adult
+
+    # Child extra beds
+    price += occ.get("child_paid_extra_under_6", 0) * (extra_bed_child_u6 + child_meal_u6)
+    price += occ.get("child_paid_extra_6_to_12", 0) * (extra_bed_child_6 + child_meal_6)
+
+    # Child sharing meal supplements
+    price += occ.get("child_paid_sharing_under_6", 0) * child_meal_u6
+    price += occ.get("child_paid_sharing_6_to_12", 0) * child_meal_6
+
+    return round(price)
+
+# ─────────────────────────────────────────────
+# ROW EXPANSION
+# ─────────────────────────────────────────────
+
+def expand_contract_rates(hotel_name, room_seasons, meal_plans, occupancy_combinations, supplement_rules):
+    rows = []
+    for season in room_seasons:
+        room = season["room"]
+        base_bb = season["base_bb"]
+        season_begin = date_to_excel_serial(season["season_begin"])
+        season_end = date_to_excel_serial(season["season_end"])
+        season_type = season["season_type"]
+        res_date_from = date_to_excel_serial(season["res_date_from"])
+        res_date_till = date_to_excel_serial(season["res_date_till"])
+
+        for meal in meal_plans:
+            for occ in occupancy_combinations:
+                price = calculate_price(base_bb, meal, occ, supplement_rules)
+                row = {
+                    "Hotel": hotel_name,
+                    "Room": room,
+                    "Accommodation": occ["label"],
+                    "Meal": meal,
+                    "Season begin": season_begin,
+                    "Season end": season_end,
+                    "Reservation date from": res_date_from,
+                    "Reservation date till": res_date_till,
+                    "Nights": 1,
+                    "Hotel net price": price,
+                    "Number of markups": 1,
+                    "Currency (code)": "AED",
+                    "Currency": "Dirham",
+                    "Season type": season_type,
+                    "Market code": "",
+                    "Price type": "Standard",
+                    "Staying nights from": 1,
+                    "Staying nights till": 366,
+                    "Booking code": ""
+                }
+                rows.append([row.get(h, "") for h in CONTRACT_HEADERS])
+    return rows
+
+def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, occupancy_combinations, supplement_rules, mlos, mlos_till):
+    rows = []
+    for season in room_seasons:
+        room = season["room"]
+        base_rate = season["base_rate"]
+        base_meal = season["meal_plan"]
+        season_begin = date_to_excel_serial(season["season_begin"])
+        season_end = date_to_excel_serial(season["season_end"])
+        season_type = season["season_type"]
+        res_date_from = date_to_excel_serial(season["res_date_from"])
+        res_date_till = date_to_excel_serial(season["res_date_till"])
+
+        for meal in meal_plans:
+            for occ in occupancy_combinations:
+                price = calculate_price(base_rate, meal, occ, supplement_rules)
+                row = {
+                    "SPO No": "",
+                    "Price type": "Standard",
+                    "Hotel": hotel_name,
+                    "Room": room,
+                    "Accommodation": occ["label"],
+                    "Meal": meal,
+                    "Hotel net price": price,
+                    "Currency (code)": "AED",
+                    "Market code": "",
+                    "Season begin": season_begin,
+                    "Season end": season_end,
+                    "Days before check-in from": "",
+                    "Reservation date from": res_date_from,
+                    "Reservation date till": res_date_till,
+                    "Check-in from": "",
+                    "Check-in till": "",
+                    "Check-out from": "",
+                    "Staying nights from": mlos,
+                    "Check-out till": "",
+                    "Nights": 1,
+                    "Nights from": "",
+                    "Nights till": "",
+                    "Number of markups": 1,
+                    "Nights free": "",
+                    "Season type": season_type,
+                    "Days before check-in till": "",
+                    "Staying nights till": mlos_till,
+                    "Booking code": promo_code
+                }
+                rows.append([row.get(h, "") for h in PROMOTION_HEADERS])
+    return rows
+
+# ─────────────────────────────────────────────
+# API ROUTES
+# ─────────────────────────────────────────────
+
+@app.route("/api/process", methods=["POST"])
+def process_pdfs():
     try:
-        response = client.messages.create(
+        contract_file = request.files.get("contract")
+        promotion_file = request.files.get("promotion")
+
+        if not contract_file:
+            return jsonify({"error": "Contract PDF is required"}), 400
+
+        contract_text = extract_text_from_pdf(contract_file)
+
+        contract_response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            tools=[tool_schema],
-            tool_choice={"type": "tool", "name": "output_rate_sheet"},
+            max_tokens=4000,
+            system=CONTRACT_EXTRACTION_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Extract all rate data from this hotel contract:\n\n{contract_text}"
+                }
+            ]
         )
+
+        raw_contract = clean_json_response(contract_response.content[0].text)
+        contract_data = json.loads(raw_contract)
+
+        contract_rows = expand_contract_rates(
+            hotel_name=contract_data["hotel_name"],
+            room_seasons=contract_data["room_seasons"],
+            meal_plans=contract_data["meal_plans"],
+            occupancy_combinations=contract_data["occupancy_combinations"],
+            supplement_rules=contract_data["supplement_rules"]
+        )
+
+        contract_excel = generate_excel_from_data(contract_rows, CONTRACT_HEADERS)
+        result = {"contract_excel": contract_excel}
+
+        if promotion_file:
+            promotion_text = extract_text_from_pdf(promotion_file)
+
+            promotion_response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4000,
+                system=PROMOTION_EXTRACTION_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Extract all rate data from this promotion PDF. Contract is provided for context on supplement rules if not stated in promotion.\n\nPROMOTION:\n{promotion_text}\n\nCONTRACT CONTEXT:\n{contract_text}"
+                    }
+                ]
+            )
+
+            raw_promotion = clean_json_response(promotion_response.content[0].text)
+            promotion_data = json.loads(raw_promotion)
+
+            promotion_rows = expand_promotion_rates(
+                hotel_name=promotion_data["hotel_name"],
+                promo_code=promotion_data.get("promo_code", ""),
+                room_seasons=promotion_data["room_seasons"],
+                meal_plans=promotion_data["meal_plans"],
+                occupancy_combinations=promotion_data["occupancy_combinations"],
+                supplement_rules=promotion_data["supplement_rules"],
+                mlos=promotion_data.get("mlos", 1),
+                mlos_till=promotion_data.get("mlos_till", 366)
+            )
+
+            promotion_excel = generate_excel_from_data(promotion_rows, PROMOTION_HEADERS)
+            result["promotion_excel"] = promotion_excel
+
+        return jsonify(result)
+
+    except json.JSONDecodeError as e:
+        return jsonify({"error": f"Failed to parse Claude response: {str(e)}"}), 500
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Claude API error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-    try:
-        tool_output = response.content[0]
-        if tool_output.type != "tool_use":
-            raise ValueError("Claude did not use the tool")
-        raw_json = tool_output.input
-        output = OutputSchema(**raw_json)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse Claude output: {str(e)}")
-
-    contract_excel_bytes = create_contract_excel_bytes(output.contract_rates)
-    promotion_excel_bytes = create_promotion_excel_bytes(output.promotion_rates) if output.promotion_rates else None
-
-    return contract_excel_bytes, promotion_excel_bytes
-
-# -------------------- Endpoints --------------------
-@app.post("/api/process")
-async def process_api(
-    contract: UploadFile = File(...),
-    promotion: Optional[UploadFile] = File(None)
-):
-    """Endpoint that Lovable expects: returns JSON with base64 Excel files."""
-    if not contract.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Contract file must be PDF")
-    if promotion and not promotion.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Promotion file must be PDF")
-
-    try:
-        contract_excel_bytes, promotion_excel_bytes = await process_pdfs(contract, promotion)
-
-        result = {
-            "contract_excel": base64.b64encode(contract_excel_bytes).decode("utf-8")
-        }
-        if promotion_excel_bytes:
-            result["promotion_excel"] = base64.b64encode(promotion_excel_bytes).decode("utf-8")
-
-        return JSONResponse(content=result)
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.post("/process")
-async def process_zip(
-    contract: UploadFile = File(...),
-    promotion: Optional[UploadFile] = File(None)
-):
-    """Alternative endpoint: returns ZIP file for manual testing."""
-    if not contract.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Contract file must be PDF")
-    if promotion and not promotion.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Promotion file must be PDF")
-
-    contract_excel_bytes, promotion_excel_bytes = await process_pdfs(contract, promotion)
-
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr("Contract_Rates.xlsx", contract_excel_bytes)
-        if promotion_excel_bytes:
-            zip_file.writestr("Promotion_Rates.xlsx", promotion_excel_bytes)
-
-    zip_buffer.seek(0)
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=rate_sheets.zip"}
-    )
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.get("/")
-async def root():
-    return {"message": "RateFlow backend is running. Use POST /api/process for Lovable."}
-
-@app.get("/api/process")
-async def process_get():
-    return {"message": "This endpoint requires a POST request with PDF files."}
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def catch_all(request: Request, path: str):
-    return JSONResponse(
-        status_code=404,
-        content={
-            "message": f"Request received at path /{path}",
-            "method": request.method,
-            "full_url": str(request.url),
-            "note": "Check your frontend URL."
-        }
-    )
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    app.run(debug=True)
