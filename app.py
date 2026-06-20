@@ -6,6 +6,7 @@ from flask_cors import CORS
 import anthropic
 from openpyxl import Workbook
 import PyPDF2
+import fitz  # pymupdf
 import io
 from datetime import datetime, timedelta
 
@@ -19,11 +20,45 @@ client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 # ─────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_file):
-    reader = PyPDF2.PdfReader(pdf_file)
+    """Try text extraction first. If the PDF is image-based (scanned),
+    return None so the caller knows to use vision instead."""
+    pdf_bytes = pdf_file.read()
+    pdf_file.seek(0)
+
+    reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
     text = ""
     for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+        text += (page.extract_text() or "") + "\n"
+
+    if len(text.strip()) > 100:
+        return text, None  # text OK, no images needed
+
+    # Scanned PDF — render each page as an image for Claude vision
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    for page in doc:
+        mat = fitz.Matrix(2, 2)  # 2x zoom for readability
+        pix = page.get_pixmap(matrix=mat)
+        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+        images.append(img_b64)
+    doc.close()
+    return None, images  # no text, images ready
+
+
+def build_user_message_for_claude(text, images, prompt_suffix):
+    """Build the user message content — text or vision depending on PDF type."""
+    if text:
+        return [{"type": "text", "text": f"{prompt_suffix}\n\n{text}"}]
+
+    # Vision: send each page image + extraction instruction
+    content = []
+    for img_b64 in images:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": img_b64}
+        })
+    content.append({"type": "text", "text": prompt_suffix})
+    return content
 
 def clean_json_response(text):
     text = text.strip()
@@ -37,33 +72,20 @@ def clean_json_response(text):
                 return part.strip()
     return text.strip()
 
-def parse_date(date_str):
-    """Convert DD/MM/YYYY string to a Python date object for openpyxl."""
+def date_to_excel_serial(date_str):
+    """Convert DD/MM/YYYY string to Excel serial number."""
     try:
-        return datetime.strptime(date_str.strip(), "%d/%m/%Y").date()
+        d = datetime.strptime(date_str.strip(), "%d/%m/%Y")
+        return (d - datetime(1899, 12, 30)).days
     except:
-        return None
-
-# Columns that should be formatted as dates in the output Excel
-DATE_COLUMNS = {
-    "Season begin", "Season end",
-    "Reservation date from", "Reservation date till",
-    "Check-in from", "Check-in till", "Check-out from", "Check-out till",
-}
+        return 0
 
 def generate_excel_from_data(rows, headers):
-    import datetime as dt
     wb = Workbook()
     ws = wb.active
     ws.append(headers)
-    date_col_indices = {i for i, h in enumerate(headers) if h in DATE_COLUMNS}
     for row in rows:
         ws.append(row)
-    for col_idx in date_col_indices:
-        col_letter = ws.cell(row=1, column=col_idx + 1).column_letter
-        for cell in ws[col_letter][1:]:
-            if isinstance(cell.value, dt.date):
-                cell.number_format = "DD/MM/YYYY"
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -135,7 +157,7 @@ Return ONLY this JSON structure, no markdown, no explanation:
       "base_bb": number,
       "season_begin": "DD/MM/YYYY",
       "season_end": "DD/MM/YYYY",
-      "season_type": "Low or Shoulder or High",
+      "season_type": "Low or Shoulder or High or Peak",
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
     }
@@ -161,7 +183,7 @@ IMPORTANT RULES:
 - res_date_till per season = that season's end date
 - reservation_date_from = overall contract start (when bookings open)
 - reservation_date_till = overall contract end date
-- season_type must be exactly: "Low", "Shoulder", or "High"
+- season_type must be exactly: "Low", "Shoulder", "High", or "Peak"
 - If the hotel only has BB (no Room Only), do not include Room Only in meal_plans
 - Extract supplement rules exactly as stated in the contract
 - If a supplement is "free" set it to 0
@@ -202,7 +224,7 @@ Return ONLY this JSON structure, no markdown, no explanation:
       "meal_plan": "string",
       "season_begin": "DD/MM/YYYY",
       "season_end": "DD/MM/YYYY",
-      "season_type": "Low or Shoulder or High",
+      "season_type": "Low or Shoulder or High or Peak",
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
     }
@@ -228,7 +250,7 @@ IMPORTANT RULES:
 - mlos_till = maximum length of stay (default 366 if not stated)
 - base_rate is the PROMO/FINAL SELLING RATE for that room and meal plan
 - meal_plan per room_season is the base meal plan of the promo rate
-- season_type must be exactly: "Low", "Shoulder", or "High"
+- season_type must be exactly: "Low", "Shoulder", "High", or "Peak"
 - Extract supplement rules exactly as stated in the promotion PDF
 - Return ONLY raw JSON. Nothing else.
 """
@@ -301,11 +323,11 @@ def expand_contract_rates(hotel_name, room_seasons, meal_plans, occupancy_combin
     for season in room_seasons:
         room = season["room"]
         base_bb = season["base_bb"]
-        season_begin = parse_date(season["season_begin"])
-        season_end = parse_date(season["season_end"])
+        season_begin = date_to_excel_serial(season["season_begin"])
+        season_end = date_to_excel_serial(season["season_end"])
         season_type = season["season_type"]
-        res_date_from = parse_date(season["res_date_from"])
-        res_date_till = parse_date(season["res_date_till"])
+        res_date_from = date_to_excel_serial(season["res_date_from"])
+        res_date_till = date_to_excel_serial(season["res_date_till"])
 
         for meal in meal_plans:
             for occ in occupancy_combinations:
@@ -340,11 +362,11 @@ def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, occ
         room = season["room"]
         base_rate = season["base_rate"]
         base_meal = season["meal_plan"]
-        season_begin = parse_date(season["season_begin"])
-        season_end = parse_date(season["season_end"])
+        season_begin = date_to_excel_serial(season["season_begin"])
+        season_end = date_to_excel_serial(season["season_end"])
         season_type = season["season_type"]
-        res_date_from = parse_date(season["res_date_from"])
-        res_date_till = parse_date(season["res_date_till"])
+        res_date_from = date_to_excel_serial(season["res_date_from"])
+        res_date_till = date_to_excel_serial(season["res_date_till"])
 
         for meal in meal_plans:
             for occ in occupancy_combinations:
@@ -395,18 +417,19 @@ def process_pdfs():
         if not contract_file:
             return jsonify({"error": "Contract PDF is required"}), 400
 
-        contract_text = extract_text_from_pdf(contract_file)
+        contract_text, contract_images = extract_text_from_pdf(contract_file)
 
         contract_response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4000,
             system=CONTRACT_EXTRACTION_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Extract all rate data from this hotel contract:\n\n{contract_text}"
-                }
-            ]
+            messages=[{
+                "role": "user",
+                "content": build_user_message_for_claude(
+                    contract_text, contract_images,
+                    "Extract all rate data from this hotel contract:"
+                )
+            }]
         )
 
         raw_contract = clean_json_response(contract_response.content[0].text)
@@ -424,18 +447,22 @@ def process_pdfs():
         result = {"contract_excel": contract_excel}
 
         if promotion_file:
-            promotion_text = extract_text_from_pdf(promotion_file)
+            promotion_text, promotion_images = extract_text_from_pdf(promotion_file)
+
+            # Build context suffix — include contract text if available for supplement fallback
+            context_note = "\n\nCONTRACT CONTEXT (for supplement rules if not in promotion):\n" + contract_text if contract_text else ""
 
             promotion_response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
                 system=PROMOTION_EXTRACTION_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Extract all rate data from this promotion PDF. Contract is provided for context on supplement rules if not stated in promotion.\n\nPROMOTION:\n{promotion_text}\n\nCONTRACT CONTEXT:\n{contract_text}"
-                    }
-                ]
+                messages=[{
+                    "role": "user",
+                    "content": build_user_message_for_claude(
+                        promotion_text, promotion_images,
+                        f"Extract all rate data from this promotion PDF.{context_note}"
+                    )
+                }]
             )
 
             raw_promotion = clean_json_response(promotion_response.content[0].text)
