@@ -6,7 +6,6 @@ from flask_cors import CORS
 import anthropic
 from openpyxl import Workbook
 import PyPDF2
-import fitz  # pymupdf
 import io
 from datetime import datetime, timedelta
 
@@ -20,45 +19,11 @@ client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 # ─────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_file):
-    """Try text extraction first. If the PDF is image-based (scanned),
-    return None so the caller knows to use vision instead."""
-    pdf_bytes = pdf_file.read()
-    pdf_file.seek(0)
-
-    reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+    reader = PyPDF2.PdfReader(pdf_file)
     text = ""
     for page in reader.pages:
-        text += (page.extract_text() or "") + "\n"
-
-    if len(text.strip()) > 100:
-        return text, None  # text OK, no images needed
-
-    # Scanned PDF — render each page as an image for Claude vision
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images = []
-    for page in doc:
-        mat = fitz.Matrix(2, 2)  # 2x zoom for readability
-        pix = page.get_pixmap(matrix=mat)
-        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-        images.append(img_b64)
-    doc.close()
-    return None, images  # no text, images ready
-
-
-def build_user_message_for_claude(text, images, prompt_suffix):
-    """Build the user message content — text or vision depending on PDF type."""
-    if text:
-        return [{"type": "text", "text": f"{prompt_suffix}\n\n{text}"}]
-
-    # Vision: send each page image + extraction instruction
-    content = []
-    for img_b64 in images:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": img_b64}
-        })
-    content.append({"type": "text", "text": prompt_suffix})
-    return content
+        text += page.extract_text() + "\n"
+    return text
 
 def clean_json_response(text):
     text = text.strip()
@@ -124,136 +89,123 @@ PROMOTION_HEADERS = [
 CONTRACT_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-Your job is to read a hotel contract PDF and extract ALL rate data needed to build a complete rate sheet.
+Extract rate data from this hotel contract PDF and return it as a single valid JSON object.
 
-You must extract:
-1. Hotel name
-2. Contract validity dates (reservation_date_from and reservation_date_till)
-3. For each room type and each season period: the BB SGL/DBL base rate
-4. The supplement rules specific to this hotel (meal plan supplements per person, extra bed charges, child policy)
-5. All available meal plans (Room Only, BB, HB, FB, etc.)
-6. All valid occupancy combinations used by this hotel
-
-Return ONLY this JSON structure, no markdown, no explanation:
+Return ONLY this JSON structure, no markdown, no explanation, no trailing commas:
 {
   "hotel_name": "string",
   "reservation_date_from": "DD/MM/YYYY",
   "reservation_date_till": "DD/MM/YYYY",
-  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board", "Full Board"],
+  "meal_plans": ["Bed and Breakfast"],
   "supplement_rules": {
-    "hb_per_adult": number,
-    "fb_per_adult": number,
-    "extra_bed_adult": number,
-    "extra_bed_child_under_6": number,
-    "extra_bed_child_6_to_12": number,
-    "child_meal_hb_under_6": number,
-    "child_meal_hb_6_to_12": number,
-    "child_meal_fb_under_6": number,
-    "child_meal_fb_6_to_12": number
+    "hb_per_adult": 0,
+    "fb_per_adult": 0,
+    "extra_bed_adult": 0,
+    "extra_bed_child_under_6": 0,
+    "extra_bed_child_6_to_12": 0,
+    "child_meal_hb_under_6": 0,
+    "child_meal_hb_6_to_12": 0,
+    "child_meal_fb_under_6": 0,
+    "child_meal_fb_6_to_12": 0
   },
   "room_seasons": [
     {
       "room": "string",
-      "base_bb": number,
+      "base_bb": 0,
       "season_begin": "DD/MM/YYYY",
       "season_end": "DD/MM/YYYY",
-      "season_type": "Low or Shoulder or High or Peak",
+      "season_type": "Low",
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
-    }
-  ],
-  "occupancy_combinations": [
-    {
-      "label": "string",
-      "adults": number,
-      "adult_extra_beds": number,
-      "child_free_sharing": number,
-      "child_paid_sharing_under_6": number,
-      "child_paid_sharing_6_to_12": number,
-      "child_free_extra": number,
-      "child_paid_extra_under_6": number,
-      "child_paid_extra_6_to_12": number
     }
   ]
 }
 
-IMPORTANT RULES:
-- All dates must be in DD/MM/YYYY format
-- res_date_from per season = contract signing date or opening booking date
-- res_date_till per season = that season's end date
-- reservation_date_from = overall contract start (when bookings open)
-- reservation_date_till = overall contract end date
-- season_type must be exactly: "Low", "Shoulder", "High", or "Peak"
-- If the hotel only has BB (no Room Only), do not include Room Only in meal_plans
-- Extract supplement rules exactly as stated in the contract
-- If a supplement is "free" set it to 0
-- Return ONLY raw JSON. Nothing else.
+RATE EXTRACTION RULES:
+- base_bb is the Double Occupancy (2A) BB rate per room per night
+- If rates table has columns per occupancy (1A, 2A, 2A+1C, 3A), use the 2A column as base_bb
+- One room_seasons entry per room type per season date range
+- If a season has non-consecutive dates (e.g. High = Nov-May AND Sep-Oct), create a separate entry for each range
+
+DATE RULES:
+- reservation_date_from = contract start date (first valid stay date)
+- reservation_date_till = contract end date (last valid stay date)
+- res_date_from per season = same as top-level reservation_date_from
+- res_date_till per season = same as top-level reservation_date_till — NEVER the season end date
+- season_begin / season_end = actual stay check-in/check-out dates for that period
+- All dates in DD/MM/YYYY format
+
+SUPPLEMENT RULES:
+- Add HB and FB to meal_plans only if explicitly offered in the contract
+- Set any supplement to 0 if described as free or complimentary
+- season_type must be exactly one of: "Low", "Shoulder", "High", "Peak"
+
+OUTPUT: Valid JSON only. No trailing commas. No comments. No markdown fences.
 """
+
 
 PROMOTION_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-Your job is to read a hotel promotion/SPO PDF and extract ALL rate data needed to build a complete promotion rate sheet.
+Extract all rate data from this hotel promotion/SPO PDF and return a single valid JSON object.
 
-CRITICAL: Use the FINAL SELLING RATE or PROMO RATE as base rate. Never use contracted rates.
+CRITICAL: Use the FINAL DISCOUNTED/PROMO RATE as base_rate — never the contracted rate.
 
-Return ONLY this JSON structure, no markdown, no explanation:
+Return ONLY this JSON structure, no markdown, no explanation, no trailing commas:
 {
   "hotel_name": "string",
   "promo_code": "string",
   "reservation_date_from": "DD/MM/YYYY",
   "reservation_date_till": "DD/MM/YYYY",
-  "mlos": number,
-  "mlos_till": number,
-  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board"],
+  "mlos": 1,
+  "mlos_till": 366,
+  "meal_plans": ["Bed and Breakfast"],
   "supplement_rules": {
-    "hb_per_adult": number,
-    "fb_per_adult": number,
-    "extra_bed_adult": number,
-    "extra_bed_child_under_6": number,
-    "extra_bed_child_6_to_12": number,
-    "child_meal_hb_under_6": number,
-    "child_meal_hb_6_to_12": number,
-    "child_meal_fb_under_6": number,
-    "child_meal_fb_6_to_12": number
+    "hb_per_adult": 0,
+    "fb_per_adult": 0,
+    "extra_bed_adult": 0,
+    "extra_bed_child_under_6": 0,
+    "extra_bed_child_6_to_12": 0,
+    "child_meal_hb_under_6": 0,
+    "child_meal_hb_6_to_12": 0,
+    "child_meal_fb_under_6": 0,
+    "child_meal_fb_6_to_12": 0
   },
   "room_seasons": [
     {
       "room": "string",
-      "base_rate": number,
-      "meal_plan": "string",
+      "base_rate": 0,
+      "meal_plan": "Bed and Breakfast",
       "season_begin": "DD/MM/YYYY",
       "season_end": "DD/MM/YYYY",
-      "season_type": "Low or Shoulder or High or Peak",
+      "season_type": "Low",
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
-    }
-  ],
-  "occupancy_combinations": [
-    {
-      "label": "string",
-      "adults": number,
-      "adult_extra_beds": number,
-      "child_free_sharing": number,
-      "child_paid_sharing_under_6": number,
-      "child_paid_sharing_6_to_12": number,
-      "child_free_extra": number,
-      "child_paid_extra_under_6": number,
-      "child_paid_extra_6_to_12": number
     }
   ]
 }
 
-IMPORTANT RULES:
-- All dates must be in DD/MM/YYYY format
+RATE EXTRACTION RULES:
+- base_rate = the final selling rate after discount for that room and date range
+- If the promo table shows many date rows per room type, create one room_seasons entry per room per date row
+- meal_plan = the meal plan the base_rate is quoted at (usually "Bed and Breakfast")
+- season_type must be exactly: "Low", "Shoulder", "High", or "Peak"
+
+DATE RULES:
+- reservation_date_from = booking open date for this promotion
+- reservation_date_till = last date a booking can be made for this promotion
+- res_date_from per season = same as top-level reservation_date_from
+- res_date_till per season = same as top-level reservation_date_till — NOT the season_end date
+- season_begin / season_end = the actual stay dates for that row
+- All dates in DD/MM/YYYY format
+
+OTHER RULES:
 - mlos = minimum length of stay (default 1 if not stated)
 - mlos_till = maximum length of stay (default 366 if not stated)
-- base_rate is the PROMO/FINAL SELLING RATE for that room and meal plan
-- meal_plan per room_season is the base meal plan of the promo rate
-- season_type must be exactly: "Low", "Shoulder", "High", or "Peak"
-- Extract supplement rules exactly as stated in the promotion PDF
-- Return ONLY raw JSON. Nothing else.
+- Set supplements to 0 if free/complimentary or if not stated in promotion (fallback to contract context)
+- OUTPUT: Valid JSON only. No trailing commas. No comments. No markdown.
 """
+
 
 # ─────────────────────────────────────────────
 # PRICE CALCULATION
@@ -417,19 +369,18 @@ def process_pdfs():
         if not contract_file:
             return jsonify({"error": "Contract PDF is required"}), 400
 
-        contract_text, contract_images = extract_text_from_pdf(contract_file)
+        contract_text = extract_text_from_pdf(contract_file)
 
         contract_response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4000,
+            max_tokens=8000,
             system=CONTRACT_EXTRACTION_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": build_user_message_for_claude(
-                    contract_text, contract_images,
-                    "Extract all rate data from this hotel contract:"
-                )
-            }]
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Extract all rate data from this hotel contract:\n\n{contract_text}"
+                }
+            ]
         )
 
         raw_contract = clean_json_response(contract_response.content[0].text)
@@ -447,22 +398,18 @@ def process_pdfs():
         result = {"contract_excel": contract_excel}
 
         if promotion_file:
-            promotion_text, promotion_images = extract_text_from_pdf(promotion_file)
-
-            # Build context suffix — include contract text if available for supplement fallback
-            context_note = "\n\nCONTRACT CONTEXT (for supplement rules if not in promotion):\n" + contract_text if contract_text else ""
+            promotion_text = extract_text_from_pdf(promotion_file)
 
             promotion_response = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=4000,
+                max_tokens=8000,
                 system=PROMOTION_EXTRACTION_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": build_user_message_for_claude(
-                        promotion_text, promotion_images,
-                        f"Extract all rate data from this promotion PDF.{context_note}"
-                    )
-                }]
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Extract all rate data from this promotion PDF. Contract is provided for context on supplement rules if not stated in promotion.\n\nPROMOTION:\n{promotion_text}\n\nCONTRACT CONTEXT:\n{contract_text}"
+                    }
+                ]
             )
 
             raw_promotion = clean_json_response(promotion_response.content[0].text)
@@ -485,9 +432,15 @@ def process_pdfs():
         return jsonify(result)
 
     except json.JSONDecodeError as e:
-        return jsonify({"error": f"Failed to parse Claude response: {str(e)}"}), 500
+        # Return the raw Claude response so the issue can be diagnosed
+        raw = locals().get("raw_contract") or locals().get("raw_promotion") or "unavailable"
+        return jsonify({
+            "error": f"Failed to parse Claude response: {str(e)}",
+            "raw_response": raw[:2000]  # first 2000 chars for debugging
+        }), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-1000:]}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
