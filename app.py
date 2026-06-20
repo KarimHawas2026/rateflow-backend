@@ -37,20 +37,33 @@ def clean_json_response(text):
                 return part.strip()
     return text.strip()
 
-def date_to_excel_serial(date_str):
-    """Convert DD/MM/YYYY string to Excel serial number."""
+def parse_date(date_str):
+    """Convert DD/MM/YYYY string to a Python date object for openpyxl."""
     try:
-        d = datetime.strptime(date_str.strip(), "%d/%m/%Y")
-        return (d - datetime(1899, 12, 30)).days
+        return datetime.strptime(date_str.strip(), "%d/%m/%Y").date()
     except:
-        return 0
+        return None
+
+# Columns that should be formatted as dates in the output Excel
+DATE_COLUMNS = {
+    "Season begin", "Season end",
+    "Reservation date from", "Reservation date till",
+    "Check-in from", "Check-in till", "Check-out from", "Check-out till",
+}
 
 def generate_excel_from_data(rows, headers):
+    import datetime as dt
     wb = Workbook()
     ws = wb.active
     ws.append(headers)
+    date_col_indices = {i for i, h in enumerate(headers) if h in DATE_COLUMNS}
     for row in rows:
         ws.append(row)
+    for col_idx in date_col_indices:
+        col_letter = ws.cell(row=1, column=col_idx + 1).column_letter
+        for cell in ws[col_letter][1:]:
+            if isinstance(cell.value, dt.date):
+                cell.number_format = "DD/MM/YYYY"
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -83,57 +96,28 @@ PROMOTION_HEADERS = [
 ]
 
 # ─────────────────────────────────────────────
-# STANDARD OCCUPANCY COMBINATIONS
-# Hardcoded — Voyage Tours uses these labels across all hotels.
-# Claude only extracts supplement rules; Python handles occupancy.
-# ─────────────────────────────────────────────
-
-STANDARD_OCCUPANCY_COMBINATIONS = [
-    # Adults only
-    {"label": "1ADL",         "adults": 1, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL",         "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "3ADL",         "adults": 2, "adult_extra_beds": 1, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    # 2 Adults + children sharing
-    {"label": "2ADL+1-CHILD SHARING",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 1, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+1-CHILD06 SHARING", "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 1, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+1-CHILD12 SHARING", "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 1, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+2-CHILD SHARING",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 2, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+1CH06+1CH12 SHARING","adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 1, "child_paid_sharing_6_to_12": 1, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+2-CHILD06 SHARING", "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 2, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+2-CHILD12 SHARING", "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 2, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0},
-    # 2 Adults + children on extra bed
-    {"label": "2ADL+1-CHILD06 EXTRA",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 1, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+1-CHILD12 EXTRA",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 1},
-    {"label": "2ADL+2-CHILD06 EXTRA",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 2, "child_paid_extra_6_to_12": 0},
-    {"label": "2ADL+2-CHILD12 EXTRA",   "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 2},
-    {"label": "2ADL+1CH06+1CH12 EXTRA", "adults": 2, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 1, "child_paid_extra_6_to_12": 1},
-    # 1 Adult + children on extra bed
-    {"label": "1ADL+1-CHILD06 EXTRA",   "adults": 1, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 1, "child_paid_extra_6_to_12": 0},
-    {"label": "1ADL+1-CHILD12 EXTRA",   "adults": 1, "adult_extra_beds": 0, "child_free_sharing": 0, "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0, "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 1},
-]
-
-# ─────────────────────────────────────────────
 # CLAUDE PROMPTS
 # ─────────────────────────────────────────────
 
 CONTRACT_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-Your job is to read a hotel contract PDF and extract rate data needed to build a complete rate sheet.
+Your job is to read a hotel contract PDF and extract ALL rate data needed to build a complete rate sheet.
 
 You must extract:
-1. Hotel name (single specific property only — not a combined name if multiple hotels are in the PDF)
-2. Contract validity dates (when bookings open and the last travel/stay date)
-3. For each room type and each season period: the BB DBL base rate (double room, bed & breakfast, per room per night)
-4. The supplement rules: meal plan add-ons per person, extra bed charges, child policy
-5. All available meal plans offered
+1. Hotel name
+2. Contract validity dates (reservation_date_from and reservation_date_till)
+3. For each room type and each season period: the BB SGL/DBL base rate
+4. The supplement rules specific to this hotel (meal plan supplements per person, extra bed charges, child policy)
+5. All available meal plans (Room Only, BB, HB, FB, etc.)
+6. All valid occupancy combinations used by this hotel
 
 Return ONLY this JSON structure, no markdown, no explanation:
 {
   "hotel_name": "string",
   "reservation_date_from": "DD/MM/YYYY",
   "reservation_date_till": "DD/MM/YYYY",
-  "meal_plans": ["Bed and Breakfast", "Half Board", "Full Board"],
+  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board", "Full Board"],
   "supplement_rules": {
     "hb_per_adult": number,
     "fb_per_adult": number,
@@ -155,28 +139,39 @@ Return ONLY this JSON structure, no markdown, no explanation:
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
     }
+  ],
+  "occupancy_combinations": [
+    {
+      "label": "string",
+      "adults": number,
+      "adult_extra_beds": number,
+      "child_free_sharing": number,
+      "child_paid_sharing_under_6": number,
+      "child_paid_sharing_6_to_12": number,
+      "child_free_extra": number,
+      "child_paid_extra_under_6": number,
+      "child_paid_extra_6_to_12": number
+    }
   ]
 }
 
-DATE RULES — read carefully:
-- reservation_date_from (top level) = the date bookings open for the whole contract
-- reservation_date_till (top level) = the LAST day of the entire contract (latest season_end date)
-- res_date_from per season = same as top-level reservation_date_from (bookings open the same day for all seasons)
-- res_date_till per season = ALWAYS equal to the top-level reservation_date_till (the full contract end date, NOT the season end date)
-- season_begin / season_end = the actual stay dates for that season period
-- All dates must be in DD/MM/YYYY format exactly
-
-OTHER RULES:
+IMPORTANT RULES:
+- All dates must be in DD/MM/YYYY format
+- res_date_from per season = contract signing date or opening booking date
+- res_date_till per season = that season's end date
+- reservation_date_from = overall contract start (when bookings open)
+- reservation_date_till = overall contract end date
 - season_type must be exactly: "Low", "Shoulder", or "High"
-- Only include "Room Only" in meal_plans if the contract explicitly offers it as a base plan
-- Extract supplement rules exactly as stated in the contract; set to 0 if "free" or "complimentary"
-- Return ONLY raw JSON. No explanation, no markdown.
+- If the hotel only has BB (no Room Only), do not include Room Only in meal_plans
+- Extract supplement rules exactly as stated in the contract
+- If a supplement is "free" set it to 0
+- Return ONLY raw JSON. Nothing else.
 """
 
 PROMOTION_EXTRACTION_PROMPT = """
 You are a hotel rate sheet expert for Voyage Tours, a Dubai-based tour operator.
 
-Your job is to read a hotel promotion/SPO PDF and extract rate data needed to build a complete promotion rate sheet.
+Your job is to read a hotel promotion/SPO PDF and extract ALL rate data needed to build a complete promotion rate sheet.
 
 CRITICAL: Use the FINAL SELLING RATE or PROMO RATE as base rate. Never use contracted rates.
 
@@ -188,7 +183,7 @@ Return ONLY this JSON structure, no markdown, no explanation:
   "reservation_date_till": "DD/MM/YYYY",
   "mlos": number,
   "mlos_till": number,
-  "meal_plans": ["Bed and Breakfast", "Half Board"],
+  "meal_plans": ["Room Only", "Bed and Breakfast", "Half Board"],
   "supplement_rules": {
     "hb_per_adult": number,
     "fb_per_adult": number,
@@ -211,58 +206,36 @@ Return ONLY this JSON structure, no markdown, no explanation:
       "res_date_from": "DD/MM/YYYY",
       "res_date_till": "DD/MM/YYYY"
     }
+  ],
+  "occupancy_combinations": [
+    {
+      "label": "string",
+      "adults": number,
+      "adult_extra_beds": number,
+      "child_free_sharing": number,
+      "child_paid_sharing_under_6": number,
+      "child_paid_sharing_6_to_12": number,
+      "child_free_extra": number,
+      "child_paid_extra_under_6": number,
+      "child_paid_extra_6_to_12": number
+    }
   ]
 }
 
-DATE RULES — read carefully:
-- reservation_date_from (top level) = the date bookings open for this promotion
-- reservation_date_till (top level) = the LAST booking date for this promotion (last day to book, not last day to stay)
-- res_date_from per season = same as top-level reservation_date_from
-- res_date_till per season = ALWAYS equal to the top-level reservation_date_till (NOT the season end date)
-- season_begin / season_end = the actual stay dates for that season/period
-- All dates must be in DD/MM/YYYY format exactly
-
-OTHER RULES:
-- mlos = minimum length of stay nights (default 1 if not stated)
-- mlos_till = maximum length of stay nights (default 366 if not stated)
+IMPORTANT RULES:
+- All dates must be in DD/MM/YYYY format
+- mlos = minimum length of stay (default 1 if not stated)
+- mlos_till = maximum length of stay (default 366 if not stated)
 - base_rate is the PROMO/FINAL SELLING RATE for that room and meal plan
-- meal_plan per room_season is the base meal plan the promo rate is quoted at
+- meal_plan per room_season is the base meal plan of the promo rate
 - season_type must be exactly: "Low", "Shoulder", or "High"
-- If supplement rules are not in the promotion, use the contract context provided
-- Set any supplement to 0 if described as "free" or "complimentary"
-- Return ONLY raw JSON. No explanation, no markdown.
+- Extract supplement rules exactly as stated in the promotion PDF
+- Return ONLY raw JSON. Nothing else.
 """
 
 # ─────────────────────────────────────────────
 # PRICE CALCULATION
 # ─────────────────────────────────────────────
-
-def validate_and_fix_dates(data, is_promotion=False):
-    """
-    Validate extracted dates and fix the most common Claude mistake:
-    res_date_till per season being set to season_end instead of contract end.
-    """
-    contract_end = data.get("reservation_date_till", "")
-
-    for season in data.get("room_seasons", []):
-        season_end = season.get("season_end", "")
-        res_till = season.get("res_date_till", "")
-
-        # If res_date_till equals season_end (the common mistake), fix it to contract end
-        if res_till == season_end and contract_end:
-            season["res_date_till"] = contract_end
-
-        # If res_date_till is missing or zero, use contract end
-        if not res_till:
-            season["res_date_till"] = contract_end
-
-        # res_date_from should never be empty
-        contract_start = data.get("reservation_date_from", "")
-        if not season.get("res_date_from") and contract_start:
-            season["res_date_from"] = contract_start
-
-    return data
-
 
 def calculate_price(base_bb, meal, occ, rules):
     """
@@ -302,28 +275,18 @@ def calculate_price(base_bb, meal, occ, rules):
 
     price = base_bb
 
-    # Adult meal supplements (all adults in room including extra bed adults)
+    # Adult meal supplements
     total_adults = occ["adults"] + occ["adult_extra_beds"]
     price += total_adults * adult_meal
 
     # Adult extra bed fee
     price += occ["adult_extra_beds"] * extra_bed_adult
 
-    # Children on extra beds
-    num_child_extra_u6 = occ.get("child_paid_extra_under_6", 0)
-    num_child_extra_6 = occ.get("child_paid_extra_6_to_12", 0)
+    # Child extra beds
+    price += occ.get("child_paid_extra_under_6", 0) * (extra_bed_child_u6 + child_meal_u6)
+    price += occ.get("child_paid_extra_6_to_12", 0) * (extra_bed_child_6 + child_meal_6)
 
-    # First child extra bed: extra_bed_fee + meal supplement
-    # Second+ child extra bed: extra_bed_fee is charged again (second_paid_child_extra_bed)
-    price += num_child_extra_u6 * (extra_bed_child_u6 + child_meal_u6)
-    price += num_child_extra_6 * (extra_bed_child_6 + child_meal_6)
-
-    # When 2 children aged 06-11.99 are on extra bed, the second child incurs an
-    # additional extra bed fee on top of the one already counted above.
-    if num_child_extra_6 >= 2:
-        price += extra_bed_child_6  # second child extra bed surcharge
-
-    # Children sharing (meal supplement only, no extra bed fee)
+    # Child sharing meal supplements
     price += occ.get("child_paid_sharing_under_6", 0) * child_meal_u6
     price += occ.get("child_paid_sharing_6_to_12", 0) * child_meal_6
 
@@ -333,17 +296,16 @@ def calculate_price(base_bb, meal, occ, rules):
 # ROW EXPANSION
 # ─────────────────────────────────────────────
 
-def expand_contract_rates(hotel_name, room_seasons, meal_plans, supplement_rules):
+def expand_contract_rates(hotel_name, room_seasons, meal_plans, occupancy_combinations, supplement_rules):
     rows = []
-    occupancy_combinations = STANDARD_OCCUPANCY_COMBINATIONS
     for season in room_seasons:
         room = season["room"]
         base_bb = season["base_bb"]
-        season_begin = date_to_excel_serial(season["season_begin"])
-        season_end = date_to_excel_serial(season["season_end"])
+        season_begin = parse_date(season["season_begin"])
+        season_end = parse_date(season["season_end"])
         season_type = season["season_type"]
-        res_date_from = date_to_excel_serial(season["res_date_from"])
-        res_date_till = date_to_excel_serial(season["res_date_till"])
+        res_date_from = parse_date(season["res_date_from"])
+        res_date_till = parse_date(season["res_date_till"])
 
         for meal in meal_plans:
             for occ in occupancy_combinations:
@@ -372,18 +334,17 @@ def expand_contract_rates(hotel_name, room_seasons, meal_plans, supplement_rules
                 rows.append([row.get(h, "") for h in CONTRACT_HEADERS])
     return rows
 
-def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, supplement_rules, mlos, mlos_till):
+def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, occupancy_combinations, supplement_rules, mlos, mlos_till):
     rows = []
-    occupancy_combinations = STANDARD_OCCUPANCY_COMBINATIONS
     for season in room_seasons:
         room = season["room"]
         base_rate = season["base_rate"]
         base_meal = season["meal_plan"]
-        season_begin = date_to_excel_serial(season["season_begin"])
-        season_end = date_to_excel_serial(season["season_end"])
+        season_begin = parse_date(season["season_begin"])
+        season_end = parse_date(season["season_end"])
         season_type = season["season_type"]
-        res_date_from = date_to_excel_serial(season["res_date_from"])
-        res_date_till = date_to_excel_serial(season["res_date_till"])
+        res_date_from = parse_date(season["res_date_from"])
+        res_date_till = parse_date(season["res_date_till"])
 
         for meal in meal_plans:
             for occ in occupancy_combinations:
@@ -450,12 +411,12 @@ def process_pdfs():
 
         raw_contract = clean_json_response(contract_response.content[0].text)
         contract_data = json.loads(raw_contract)
-        contract_data = validate_and_fix_dates(contract_data)
 
         contract_rows = expand_contract_rates(
             hotel_name=contract_data["hotel_name"],
             room_seasons=contract_data["room_seasons"],
             meal_plans=contract_data["meal_plans"],
+            occupancy_combinations=contract_data["occupancy_combinations"],
             supplement_rules=contract_data["supplement_rules"]
         )
 
@@ -479,13 +440,13 @@ def process_pdfs():
 
             raw_promotion = clean_json_response(promotion_response.content[0].text)
             promotion_data = json.loads(raw_promotion)
-            promotion_data = validate_and_fix_dates(promotion_data, is_promotion=True)
 
             promotion_rows = expand_promotion_rates(
                 hotel_name=promotion_data["hotel_name"],
                 promo_code=promotion_data.get("promo_code", ""),
                 room_seasons=promotion_data["room_seasons"],
                 meal_plans=promotion_data["meal_plans"],
+                occupancy_combinations=promotion_data["occupancy_combinations"],
                 supplement_rules=promotion_data["supplement_rules"],
                 mlos=promotion_data.get("mlos", 1),
                 mlos_till=promotion_data.get("mlos_till", 366)
