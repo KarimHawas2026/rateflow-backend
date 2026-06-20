@@ -3,4 +3,5 @@ flask-cors
 anthropic
 openpyxl
 PyPDF2
+pymupdf
 gunicorn
