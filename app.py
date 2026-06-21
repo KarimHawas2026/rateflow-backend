@@ -55,6 +55,38 @@ def clean_json_response(text):
     return text
 
 
+def call_claude(system_prompt, user_message):
+    """
+    Call Claude with extended output enabled (up to 64k tokens).
+    Falls back to a repair call if the JSON is truncated.
+    """
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=16000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+        betas=["output-128k-2025-02-19"],
+    )
+    raw = clean_json_response(response.content[0].text)
+
+    # Try parsing — if it fails due to truncation, ask Claude to complete it
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Ask Claude to complete the truncated JSON
+        repair_response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=16000,
+            system="You are a JSON repair assistant. The user will give you a truncated JSON object. Complete it so it is valid JSON. Return ONLY the completed JSON, nothing else.",
+            messages=[
+                {"role": "user", "content": f"This JSON was truncated, please complete it:\n\n{raw}"}
+            ],
+            betas=["output-128k-2025-02-19"],
+        )
+        repaired = clean_json_response(repair_response.content[0].text)
+        return json.loads(repaired)
+
+
 def parse_date(date_str):
     try:
         return datetime.strptime(date_str.strip(), "%d/%m/%Y").date()
@@ -104,80 +136,58 @@ def generate_excel_from_data(rows, headers):
 # ─────────────────────────────────────────────
 
 def generate_occupancy_combinations(policy):
-    """
-    Dynamically generate all valid occupancy combinations from the hotel's
-    occupancy policy extracted by Claude. No hardcoding — works for any hotel.
-
-    policy fields:
-      max_adults: int (e.g. 3)
-      child_age_brackets: list of dicts with {label, min_age, max_age, free_sharing, free_extra_bed, paid_extra_bed}
-        - free_sharing: child shares parents' bed for free
-        - free_extra_bed: child gets extra bed for free
-        - paid_extra_bed: child gets extra bed and pays supplement
-      max_extra_beds: int (max extra beds allowed in room, usually 1)
-    """
     max_adults = policy.get("max_adults", 2)
     brackets = policy.get("child_age_brackets", [])
     max_extra_beds = policy.get("max_extra_beds", 1)
 
     combos = []
 
-    # Separate brackets by type
     free_sharing_brackets = [b for b in brackets if b.get("free_sharing")]
     paid_sharing_brackets = [b for b in brackets if b.get("paid_sharing")]
-    free_extra_brackets = [b for b in brackets if b.get("free_extra_bed")]
-    paid_extra_brackets = [b for b in brackets if b.get("paid_extra_bed")]
+    paid_extra_brackets   = [b for b in brackets if b.get("paid_extra_bed")]
 
-    # ── Adults only ──
+    # Adults only
     for adults in range(1, max_adults + 1):
-        extra_adults = max(0, adults - 2)  # adults beyond 2 go on extra bed
+        extra_adults = max(0, adults - 2)
         base_adults = min(adults, 2)
         if extra_adults > max_extra_beds:
             continue
-        label = f"{adults}ADL"
         combos.append({
-            "label": label,
-            "adults": base_adults,
-            "adult_extra_beds": extra_adults,
-            "child_free_sharing": 0,
-            "child_paid_sharing_under_6": 0,
-            "child_paid_sharing_6_to_12": 0,
-            "child_free_extra": 0,
-            "child_paid_extra_under_6": 0,
-            "child_paid_extra_6_to_12": 0,
+            "label": f"{adults}ADL",
+            "adults": base_adults, "adult_extra_beds": extra_adults,
+            "child_free_sharing": 0, "child_paid_sharing_under_6": 0,
+            "child_paid_sharing_6_to_12": 0, "child_free_extra": 0,
+            "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
         })
 
-    # ── 2 Adults + children sharing ──
-    # Free sharing (e.g. under 6 free)
+    # 2 Adults + free-sharing children
     for b in free_sharing_brackets:
         for n in range(1, 3):
-            label = f"2ADL+{n}-CHILD SHARING"
             combos.append({
-                "label": label,
+                "label": f"2ADL+{n}-CHILD SHARING",
                 "adults": 2, "adult_extra_beds": 0,
-                "child_free_sharing": n,
-                "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0,
-                "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
+                "child_free_sharing": n, "child_paid_sharing_under_6": 0,
+                "child_paid_sharing_6_to_12": 0, "child_free_extra": 0,
+                "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
             })
-            break  # only one free-sharing bracket type needed for sharing label
+        break  # one free-sharing bracket is enough
 
-    # Paid sharing (e.g. 6-12 pays meal supplement but no extra bed)
+    # 2 Adults + paid-sharing children
     for b in paid_sharing_brackets:
-        age_label = b.get("label", "CHILD")
+        age_lbl = b.get("label", "CHILD")
+        is_u6 = b.get("max_age", 99) <= 6
         for n in range(1, 3):
-            is_u6 = "under_6" in b.get("supplement_key", "") or b.get("max_age", 99) <= 6
-            label = f"2ADL+{n}-{age_label} SHARING"
-            combo = {
-                "label": label,
+            combos.append({
+                "label": f"2ADL+{n}-{age_lbl} SHARING",
                 "adults": 2, "adult_extra_beds": 0,
                 "child_free_sharing": 0,
                 "child_paid_sharing_under_6": n if is_u6 else 0,
                 "child_paid_sharing_6_to_12": 0 if is_u6 else n,
-                "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
-            }
-            combos.append(combo)
+                "child_free_extra": 0,
+                "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
+            })
 
-    # Mixed sharing (1 free + 1 paid sharing)
+    # Mixed free + paid sharing
     if free_sharing_brackets and paid_sharing_brackets:
         pb = paid_sharing_brackets[0]
         is_u6 = pb.get("max_age", 99) <= 6
@@ -187,29 +197,26 @@ def generate_occupancy_combinations(policy):
             "child_free_sharing": 1,
             "child_paid_sharing_under_6": 1 if is_u6 else 0,
             "child_paid_sharing_6_to_12": 0 if is_u6 else 1,
-            "child_free_extra": 0, "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
+            "child_free_extra": 0,
+            "child_paid_extra_under_6": 0, "child_paid_extra_6_to_12": 0,
         })
 
-    # ── 2 Adults + children on extra bed (up to max_extra_beds) ──
+    # 2 Adults + paid extra-bed children
     for b in paid_extra_brackets:
-        age_label = b.get("label", "CHILD")
+        age_lbl = b.get("label", "CHILD")
         is_u6 = b.get("max_age", 99) <= 6
-        sup_key_u6 = "child_paid_extra_under_6"
-        sup_key_6 = "child_paid_extra_6_to_12"
         for n in range(1, max_extra_beds + 1):
-            label = f"2ADL+{n}-{age_label} EXTRA"
-            combo = {
-                "label": label,
+            combos.append({
+                "label": f"2ADL+{n}-{age_lbl} EXTRA",
                 "adults": 2, "adult_extra_beds": 0,
                 "child_free_sharing": 0,
                 "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0,
                 "child_free_extra": 0,
                 "child_paid_extra_under_6": n if is_u6 else 0,
                 "child_paid_extra_6_to_12": 0 if is_u6 else n,
-            }
-            combos.append(combo)
+            })
 
-    # Mixed extra bed (1 under-6 + 1 over-6) if two extra brackets exist and max allows
+    # Mixed extra bed (two paid brackets, two extra beds)
     if len(paid_extra_brackets) >= 2 and max_extra_beds >= 2:
         combos.append({
             "label": "2ADL+1CH U6+1CH O6 EXTRA",
@@ -220,13 +227,12 @@ def generate_occupancy_combinations(policy):
             "child_paid_extra_under_6": 1, "child_paid_extra_6_to_12": 1,
         })
 
-    # ── 1 Adult + child extra bed ──
+    # 1 Adult + paid extra-bed child
     for b in paid_extra_brackets:
-        age_label = b.get("label", "CHILD")
+        age_lbl = b.get("label", "CHILD")
         is_u6 = b.get("max_age", 99) <= 6
-        label = f"1ADL+1-{age_label} EXTRA"
         combos.append({
-            "label": label,
+            "label": f"1ADL+1-{age_lbl} EXTRA",
             "adults": 1, "adult_extra_beds": 0,
             "child_free_sharing": 0,
             "child_paid_sharing_under_6": 0, "child_paid_sharing_6_to_12": 0,
@@ -235,14 +241,12 @@ def generate_occupancy_combinations(policy):
             "child_paid_extra_6_to_12": 0 if is_u6 else 1,
         })
 
-    # Deduplicate by label
-    seen = set()
-    unique = []
+    # Deduplicate
+    seen, unique = set(), []
     for c in combos:
         if c["label"] not in seen:
             seen.add(c["label"])
             unique.append(c)
-
     return unique
 
 
@@ -310,7 +314,7 @@ Return ONLY this JSON — no markdown, no explanation, no trailing commas:
         "paid_sharing": false,
         "free_extra_bed": false,
         "paid_extra_bed": false,
-        "supplement_key": ""
+        "supplement_key": "under_6"
       }
     ]
   },
@@ -327,21 +331,21 @@ Return ONLY this JSON — no markdown, no explanation, no trailing commas:
   ]
 }
 
-OCCUPANCY POLICY RULES — read the contract child policy carefully:
-- max_adults: maximum adults the room can hold (usually 2 or 3)
+OCCUPANCY POLICY RULES:
+- max_adults: maximum adults the room can hold (2 or 3)
 - max_extra_beds: maximum extra beds allowed (usually 1)
-- child_age_brackets: one entry per distinct child age group in the contract
-  - label: short label used in accommodation names e.g. "CHILD", "CHILD06", "CHILD12"
-  - min_age / max_age: the age range (e.g. 0-5.99, 6-11.99)
+- child_age_brackets: one entry per distinct child age group
+  - label: short label e.g. "CHILD", "CHILD06", "CHILD12"
+  - min_age / max_age: the age range (e.g. 0 to 5.99, 6 to 11.99)
   - free_sharing: true if child shares existing bedding at no charge
-  - paid_sharing: true if child shares existing bedding but pays a meal supplement
-  - free_extra_bed: true if child gets an extra bed at no charge
-  - paid_extra_bed: true if child needs an extra bed and pays a supplement
+  - paid_sharing: true if child shares existing bedding but pays meal supplement
+  - free_extra_bed: true if child gets extra bed at no charge
+  - paid_extra_bed: true if child needs extra bed and pays supplement
   - supplement_key: "under_6" if max_age <= 6, else "6_to_12"
 
 RATE RULES:
 - base_bb = Double Occupancy (2A) BB rate per room per night
-- If contract shows columns per occupancy (1A, 2A, 2A+1C, 3A), use the 2A column
+- If contract shows rate columns per occupancy (1A, 2A, 2A+1C, 3A), use the 2A column
 - One room_seasons entry per room type per season date range
 - If a season spans non-consecutive dates, create a separate entry per date range
 
@@ -399,7 +403,7 @@ Return ONLY this JSON — no markdown, no explanation, no trailing commas:
         "paid_sharing": false,
         "free_extra_bed": false,
         "paid_extra_bed": false,
-        "supplement_key": ""
+        "supplement_key": "under_6"
       }
     ]
   },
@@ -416,10 +420,6 @@ Return ONLY this JSON — no markdown, no explanation, no trailing commas:
     }
   ]
 }
-
-OCCUPANCY POLICY RULES — read the promotion child policy (or contract context) carefully:
-- Extract exactly as described above for contract
-- If the promotion does not state a child policy, use the contract context provided
 
 RATE RULES:
 - base_rate = final selling rate after discount for that room and date range
@@ -438,6 +438,7 @@ OTHER RULES:
 - mlos = minimum length of stay (default 1)
 - mlos_till = maximum length of stay (default 366)
 - season_type: exactly "Low", "Shoulder", "High", or "Peak"
+- If promotion does not state child policy, use the contract context provided
 - Set supplements to 0 if free/complimentary or not stated
 - Output valid JSON only — no trailing commas, no comments, no markdown
 """
@@ -458,33 +459,25 @@ def calculate_price(base_bb, meal, occ, rules):
     child_fb_6 = rules.get("child_meal_fb_6_to_12", 0)
 
     if meal in ["Half Board", "HB"]:
-        adult_meal = hb
-        child_meal_u6 = child_hb_u6
-        child_meal_6 = child_hb_6
+        adult_meal = hb; child_meal_u6 = child_hb_u6; child_meal_6 = child_hb_6
     elif meal in ["Full Board", "FB"]:
-        adult_meal = fb
-        child_meal_u6 = child_fb_u6
-        child_meal_6 = child_fb_6
+        adult_meal = fb; child_meal_u6 = child_fb_u6; child_meal_6 = child_fb_6
     else:
-        adult_meal = 0
-        child_meal_u6 = 0
-        child_meal_6 = 0
+        adult_meal = 0; child_meal_u6 = 0; child_meal_6 = 0
 
     price = base_bb
-    total_adults = occ["adults"] + occ["adult_extra_beds"]
-    price += total_adults * adult_meal
+    price += (occ["adults"] + occ["adult_extra_beds"]) * adult_meal
     price += occ["adult_extra_beds"] * extra_bed_adult
 
-    num_child_extra_u6 = occ.get("child_paid_extra_under_6", 0)
-    num_child_extra_6 = occ.get("child_paid_extra_6_to_12", 0)
-    price += num_child_extra_u6 * (extra_bed_child_u6 + child_meal_u6)
-    price += num_child_extra_6 * (extra_bed_child_6 + child_meal_6)
-    if num_child_extra_6 >= 2:
+    n_u6 = occ.get("child_paid_extra_under_6", 0)
+    n_6  = occ.get("child_paid_extra_6_to_12", 0)
+    price += n_u6 * (extra_bed_child_u6 + child_meal_u6)
+    price += n_6  * (extra_bed_child_6  + child_meal_6)
+    if n_6 >= 2:
         price += extra_bed_child_6  # second child extra bed surcharge
 
     price += occ.get("child_paid_sharing_under_6", 0) * child_meal_u6
     price += occ.get("child_paid_sharing_6_to_12", 0) * child_meal_6
-
     return round(price)
 
 # ─────────────────────────────────────────────
@@ -495,26 +488,23 @@ def expand_contract_rates(hotel_name, room_seasons, meal_plans, supplement_rules
     combos = generate_occupancy_combinations(occupancy_policy)
     rows = []
     for season in room_seasons:
-        base_bb = season["base_bb"]
-        season_begin = parse_date(season["season_begin"])
-        season_end = parse_date(season["season_end"])
-        res_date_from = parse_date(season["res_date_from"])
-        res_date_till = parse_date(season["res_date_till"])
+        s_begin = parse_date(season["season_begin"])
+        s_end   = parse_date(season["season_end"])
+        r_from  = parse_date(season["res_date_from"])
+        r_till  = parse_date(season["res_date_till"])
         for meal in meal_plans:
             for occ in combos:
-                price = calculate_price(base_bb, meal, occ, supplement_rules)
+                price = calculate_price(season["base_bb"], meal, occ, supplement_rules)
                 row = {
                     "Hotel": hotel_name, "Room": season["room"],
                     "Accommodation": occ["label"], "Meal": meal,
-                    "Season begin": season_begin, "Season end": season_end,
-                    "Reservation date from": res_date_from,
-                    "Reservation date till": res_date_till,
+                    "Season begin": s_begin, "Season end": s_end,
+                    "Reservation date from": r_from, "Reservation date till": r_till,
                     "Nights": 1, "Hotel net price": price,
                     "Number of markups": 1, "Currency (code)": "AED",
                     "Currency": "Dirham", "Season type": season["season_type"],
                     "Market code": "", "Price type": "Standard",
-                    "Staying nights from": 1, "Staying nights till": 366,
-                    "Booking code": ""
+                    "Staying nights from": 1, "Staying nights till": 366, "Booking code": ""
                 }
                 rows.append([row.get(h, "") for h in CONTRACT_HEADERS])
     return rows
@@ -524,30 +514,25 @@ def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, sup
     combos = generate_occupancy_combinations(occupancy_policy)
     rows = []
     for season in room_seasons:
-        base_rate = season["base_rate"]
-        season_begin = parse_date(season["season_begin"])
-        season_end = parse_date(season["season_end"])
-        res_date_from = parse_date(season["res_date_from"])
-        res_date_till = parse_date(season["res_date_till"])
+        s_begin = parse_date(season["season_begin"])
+        s_end   = parse_date(season["season_end"])
+        r_from  = parse_date(season["res_date_from"])
+        r_till  = parse_date(season["res_date_till"])
         for meal in meal_plans:
             for occ in combos:
-                price = calculate_price(base_rate, meal, occ, supplement_rules)
+                price = calculate_price(season["base_rate"], meal, occ, supplement_rules)
                 row = {
                     "SPO No": "", "Price type": "Standard",
                     "Hotel": hotel_name, "Room": season["room"],
                     "Accommodation": occ["label"], "Meal": meal,
-                    "Hotel net price": price, "Currency (code)": "AED",
-                    "Market code": "",
-                    "Season begin": season_begin, "Season end": season_end,
+                    "Hotel net price": price, "Currency (code)": "AED", "Market code": "",
+                    "Season begin": s_begin, "Season end": s_end,
                     "Days before check-in from": "",
-                    "Reservation date from": res_date_from,
-                    "Reservation date till": res_date_till,
-                    "Check-in from": "", "Check-in till": "",
-                    "Check-out from": "", "Staying nights from": mlos,
-                    "Check-out till": "", "Nights": 1,
-                    "Nights from": "", "Nights till": "",
-                    "Number of markups": 1, "Nights free": "",
-                    "Season type": season["season_type"],
+                    "Reservation date from": r_from, "Reservation date till": r_till,
+                    "Check-in from": "", "Check-in till": "", "Check-out from": "",
+                    "Staying nights from": mlos, "Check-out till": "", "Nights": 1,
+                    "Nights from": "", "Nights till": "", "Number of markups": 1,
+                    "Nights free": "", "Season type": season["season_type"],
                     "Days before check-in till": "",
                     "Staying nights till": mlos_till, "Booking code": promo_code
                 }
@@ -560,6 +545,8 @@ def expand_promotion_rates(hotel_name, promo_code, room_seasons, meal_plans, sup
 
 @app.route("/api/process", methods=["POST"])
 def process_pdfs():
+    raw_contract = None
+    raw_promotion = None
     try:
         contract_file = request.files.get("contract")
         promotion_file = request.files.get("promotion")
@@ -569,21 +556,10 @@ def process_pdfs():
 
         contract_text, contract_images = extract_text_from_pdf(contract_file)
 
-        contract_response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=8000,
-            system=CONTRACT_EXTRACTION_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": build_claude_message(
-                    contract_text, contract_images,
-                    "Extract all rate data from this hotel contract:"
-                )
-            }]
+        contract_data = call_claude(
+            CONTRACT_EXTRACTION_PROMPT,
+            build_claude_message(contract_text, contract_images, "Extract all rate data from this hotel contract:")
         )
-
-        raw_contract = clean_json_response(contract_response.content[0].text)
-        contract_data = json.loads(raw_contract)
         contract_data = validate_dates(contract_data)
 
         contract_rows = expand_contract_rates(
@@ -594,28 +570,17 @@ def process_pdfs():
             occupancy_policy=contract_data["occupancy_policy"]
         )
 
-        contract_excel = generate_excel_from_data(contract_rows, CONTRACT_HEADERS)
-        result = {"contract_excel": contract_excel}
+        result = {"contract_excel": generate_excel_from_data(contract_rows, CONTRACT_HEADERS)}
 
         if promotion_file:
             promotion_text, promotion_images = extract_text_from_pdf(promotion_file)
             context_note = ("\n\nCONTRACT CONTEXT (use for supplement rules and child policy if not in promotion):\n" + contract_text) if contract_text else ""
 
-            promotion_response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8000,
-                system=PROMOTION_EXTRACTION_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": build_claude_message(
-                        promotion_text, promotion_images,
-                        f"Extract all rate data from this promotion PDF.{context_note}"
-                    )
-                }]
+            promotion_data = call_claude(
+                PROMOTION_EXTRACTION_PROMPT,
+                build_claude_message(promotion_text, promotion_images,
+                    f"Extract all rate data from this promotion PDF.{context_note}")
             )
-
-            raw_promotion = clean_json_response(promotion_response.content[0].text)
-            promotion_data = json.loads(raw_promotion)
             promotion_data = validate_dates(promotion_data)
 
             promotion_rows = expand_promotion_rates(
@@ -628,18 +593,16 @@ def process_pdfs():
                 mlos=promotion_data.get("mlos", 1),
                 mlos_till=promotion_data.get("mlos_till", 366)
             )
-
-            promotion_excel = generate_excel_from_data(promotion_rows, PROMOTION_HEADERS)
-            result["promotion_excel"] = promotion_excel
+            result["promotion_excel"] = generate_excel_from_data(promotion_rows, PROMOTION_HEADERS)
 
         return jsonify(result)
 
     except json.JSONDecodeError as e:
-        raw = locals().get("raw_contract") or locals().get("raw_promotion") or "unavailable"
-        return jsonify({"error": f"Failed to parse Claude response: {str(e)}", "raw_response": raw[:2000]}), 500
+        raw = raw_contract or raw_promotion or "unavailable"
+        return jsonify({"error": f"Failed to parse Claude response: {str(e)}", "raw_response": raw[:2000] if isinstance(raw, str) else str(raw)[:2000]}), 500
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()[-1000:]}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-1500:]}), 500
 
 
 @app.route("/health", methods=["GET"])
