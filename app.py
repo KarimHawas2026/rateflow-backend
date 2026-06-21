@@ -60,7 +60,7 @@ def call_claude(system_prompt, user_message):
     Call Claude with extended output enabled (up to 64k tokens).
     Falls back to a repair call if the JSON is truncated.
     """
-    response = client.messages.create(
+    response = client.beta.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=16000,
         system=system_prompt,
@@ -74,7 +74,7 @@ def call_claude(system_prompt, user_message):
         return json.loads(raw)
     except json.JSONDecodeError:
         # Ask Claude to complete the truncated JSON
-        repair_response = client.messages.create(
+        repair_response = client.beta.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=16000,
             system="You are a JSON repair assistant. The user will give you a truncated JSON object. Complete it so it is valid JSON. Return ONLY the completed JSON, nothing else.",
