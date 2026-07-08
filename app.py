@@ -83,69 +83,51 @@ def call_claude(system_prompt, user_message):
         raise
 
 
-def call_claude_split(system_prompt, user_message, is_promotion=False):
-    """
-    Two-pass extraction for large contracts/promotions:
-    Pass 1 gets hotel info + policy + supplements (small)
-    Pass 2 gets room_seasons only (focused, handles many rows)
-    """
-    PASS1_SYSTEM = system_prompt + """
-
-IMPORTANT FOR THIS CALL: Return ONLY the header fields — do NOT include room_seasons.
-Return this structure only (no room_seasons key):
+CONTRACT_HEADER_PROMPT = """
+You are a hotel rate sheet expert. Read this hotel contract and return ONLY this JSON — no room rates, no markdown:
 {
-  "hotel_name": "...",
+  "hotel_name": "string",
   "reservation_date_from": "DD/MM/YYYY",
   "reservation_date_till": "DD/MM/YYYY",
-  "meal_plans": [...],
-  "supplement_rules": {...},
-  "occupancy_policy": {...}
-}
-"""
-
-    if is_promotion:
-        PASS1_SYSTEM = system_prompt + """
-
-IMPORTANT FOR THIS CALL: Return ONLY the header fields — do NOT include room_seasons.
-Return this structure only (no room_seasons key):
-{
-  "hotel_name": "...",
-  "promo_code": "...",
-  "reservation_date_from": "DD/MM/YYYY",
-  "reservation_date_till": "DD/MM/YYYY",
-  "mlos": 1,
-  "mlos_till": 366,
-  "meal_plans": [...],
-  "supplement_rules": {...},
-  "occupancy_policy": {...}
-}
-"""
-        PASS2_SYSTEM = """You are a hotel rate extraction expert. Extract ONLY the room_seasons array from this promotion.
-Return ONLY a JSON array:
-[
-  {
-    "room": "string",
-    "base_rate": 0,
-    "meal_plan": "Bed and Breakfast",
-    "season_begin": "DD/MM/YYYY",
-    "season_end": "DD/MM/YYYY",
-    "season_type": "Low",
-    "res_date_from": "DD/MM/YYYY",
-    "res_date_till": "DD/MM/YYYY"
+  "meal_plans": ["Bed and Breakfast"],
+  "supplement_rules": {
+    "hb_per_adult": 0,
+    "fb_per_adult": 0,
+    "extra_bed_adult": 0,
+    "extra_bed_child_under_6": 0,
+    "extra_bed_child_6_to_12": 0,
+    "child_meal_hb_under_6": 0,
+    "child_meal_hb_6_to_12": 0,
+    "child_meal_fb_under_6": 0,
+    "child_meal_fb_6_to_12": 0
+  },
+  "occupancy_policy": {
+    "max_adults": 2,
+    "max_extra_beds": 1,
+    "child_age_brackets": [
+      {
+        "label": "CHILD",
+        "min_age": 0,
+        "max_age": 11.99,
+        "free_sharing": true,
+        "paid_sharing": false,
+        "free_extra_bed": false,
+        "paid_extra_bed": false,
+        "supplement_key": "under_6"
+      }
+    ]
   }
-]
+}
 Rules:
-- base_rate = the final discounted promo rate (not the contracted rate)
-- One entry per room type per date row in the promotion table
-- meal_plan = the meal plan the rate is quoted at
-- season_type: exactly "Low", "Shoulder", "High", or "Peak" (Festive/F = "Peak")
-- res_date_from/till = the promotion booking window dates (same for all entries)
+- meal_plans: include HB/FB only if explicitly offered
+- supplement_rules: set 0 if free/complimentary
+- occupancy_policy: read child policy carefully — one bracket per distinct age group
 - All dates DD/MM/YYYY
-- Return ONLY the raw JSON array, no markdown, no explanation
+- Output raw JSON only
 """
-    else:
-        PASS2_SYSTEM = """You are a hotel rate extraction expert. Extract ONLY the room_seasons array from this hotel contract.
-Return ONLY a JSON array:
+
+CONTRACT_SEASONS_PROMPT = """
+You are a hotel rate extraction expert. Read this hotel contract and return ONLY a JSON array of room seasons — no other text:
 [
   {
     "room": "string",
@@ -159,46 +141,122 @@ Return ONLY a JSON array:
 ]
 Rules:
 - base_bb = Double Occupancy (2A) BB rate per room per night
-- If rates show per-occupancy columns (1A, 2A etc), use the 2A column
+- If the rate table has occupancy columns (1A, 2A, 2A+1C, 3A), use the 2A column
 - One entry per room type per season date range
-- season_type: exactly "Low", "Shoulder", "High", or "Peak" (Festive/F = "Peak")
-- res_date_from = contract start date (same for all entries)
-- res_date_till = contract end date (same for all entries, NOT the season end date)
+- If a season has non-consecutive dates, create a separate entry per date range
+- season_type: exactly "Low", "Shoulder", "High", or "Peak" (map Festive/F to "Peak")
+- res_date_from = contract start date — same for every entry
+- res_date_till = contract end date — same for every entry, NEVER the season_end date
 - All dates DD/MM/YYYY
-- Return ONLY the raw JSON array, no markdown, no explanation
+- Output raw JSON array only — no object wrapper, no markdown
 """
 
-    # Pass 1 — header/policy
-    header_text = ""
+PROMOTION_HEADER_PROMPT = """
+You are a hotel rate sheet expert. Read this promotion/SPO and return ONLY this JSON — no room rates, no markdown:
+{
+  "hotel_name": "string",
+  "promo_code": "string",
+  "reservation_date_from": "DD/MM/YYYY",
+  "reservation_date_till": "DD/MM/YYYY",
+  "mlos": 1,
+  "mlos_till": 366,
+  "meal_plans": ["Bed and Breakfast"],
+  "supplement_rules": {
+    "hb_per_adult": 0,
+    "fb_per_adult": 0,
+    "extra_bed_adult": 0,
+    "extra_bed_child_under_6": 0,
+    "extra_bed_child_6_to_12": 0,
+    "child_meal_hb_under_6": 0,
+    "child_meal_hb_6_to_12": 0,
+    "child_meal_fb_under_6": 0,
+    "child_meal_fb_6_to_12": 0
+  },
+  "occupancy_policy": {
+    "max_adults": 2,
+    "max_extra_beds": 1,
+    "child_age_brackets": [
+      {
+        "label": "CHILD",
+        "min_age": 0,
+        "max_age": 11.99,
+        "free_sharing": true,
+        "paid_sharing": false,
+        "free_extra_bed": false,
+        "paid_extra_bed": false,
+        "supplement_key": "under_6"
+      }
+    ]
+  }
+}
+Rules:
+- reservation_date_from/till = the booking window (not the stay dates)
+- mlos = minimum nights (default 1), mlos_till = maximum nights (default 366)
+- supplement_rules: use contract context if not in promotion, set 0 if free
+- occupancy_policy: read child policy carefully
+- All dates DD/MM/YYYY
+- Output raw JSON only
+"""
+
+PROMOTION_SEASONS_PROMPT = """
+You are a hotel rate extraction expert. Read this promotion and return ONLY a JSON array of room seasons — no other text:
+[
+  {
+    "room": "string",
+    "base_rate": 0,
+    "meal_plan": "Bed and Breakfast",
+    "season_begin": "DD/MM/YYYY",
+    "season_end": "DD/MM/YYYY",
+    "season_type": "Low",
+    "res_date_from": "DD/MM/YYYY",
+    "res_date_till": "DD/MM/YYYY"
+  }
+]
+Rules:
+- base_rate = the FINAL discounted promo rate — never the contracted rate
+- One entry per room type per date row in the promotion table
+- meal_plan = the meal plan the rate is quoted at
+- season_type: exactly "Low", "Shoulder", "High", or "Peak" (Festive/F = "Peak")
+- res_date_from/till = the promotion booking window (same for all entries)
+- All dates DD/MM/YYYY
+- Output raw JSON array only — no object wrapper, no markdown
+"""
+
+
+def stream_claude(system_prompt, user_message, max_tokens=8000):
+    """Single streaming Claude call, returns parsed text."""
+    full_text = ""
     with client.beta.messages.stream(
         model="claude-sonnet-4-6",
-        max_tokens=4000,
-        system=PASS1_SYSTEM,
+        max_tokens=max_tokens,
+        system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
         betas=["output-128k-2025-02-19"],
     ) as stream:
         for text in stream.text_stream:
-            header_text += text
+            full_text += text
+    return clean_json_response(full_text)
 
-    header_data = json.loads(clean_json_response(header_text))
 
-    # Pass 2 — room seasons only
-    seasons_text = ""
-    with client.beta.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=16000,
-        system=PASS2_SYSTEM,
-        messages=[{"role": "user", "content": user_message}],
-        betas=["output-128k-2025-02-19"],
-    ) as stream:
-        for text in stream.text_stream:
-            seasons_text += text
-
-    raw_seasons = clean_json_response(seasons_text)
-    if raw_seasons.strip().startswith("["):
-        seasons = json.loads(raw_seasons)
+def call_claude_split(system_prompt, user_message, is_promotion=False):
+    """
+    Two dedicated Claude calls — header info first, then room seasons.
+    Each call has its own clean focused system prompt.
+    """
+    if is_promotion:
+        header_raw = stream_claude(PROMOTION_HEADER_PROMPT, user_message, max_tokens=4000)
+        seasons_raw = stream_claude(PROMOTION_SEASONS_PROMPT, user_message, max_tokens=16000)
     else:
-        wrapped = json.loads(raw_seasons)
+        header_raw = stream_claude(CONTRACT_HEADER_PROMPT, user_message, max_tokens=4000)
+        seasons_raw = stream_claude(CONTRACT_SEASONS_PROMPT, user_message, max_tokens=16000)
+
+    header_data = json.loads(header_raw)
+
+    seasons_clean = seasons_raw.strip()
+    if seasons_clean.startswith("["):
+        seasons = json.loads(seasons_clean)
+    else:
+        wrapped = json.loads(seasons_clean)
         seasons = wrapped.get("room_seasons", list(wrapped.values())[0] if wrapped else [])
 
     header_data["room_seasons"] = seasons
