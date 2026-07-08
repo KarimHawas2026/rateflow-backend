@@ -63,29 +63,14 @@ def clean_json_response(text):
 
 
 def call_claude(system_prompt, user_message):
-    """
-    Call Claude using streaming. For large contracts the JSON can still
-    exceed token limits, so we use a two-pass approach:
-    Pass 1: extract everything EXCEPT room_seasons
-    Pass 2: extract room_seasons only
-    Then merge.
-    """
-    full_text = ""
-    with client.beta.messages.stream(
+    """Simple non-streaming Claude call."""
+    response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=16000,
+        max_tokens=8000,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
-        betas=["output-128k-2025-02-19"],
-    ) as stream:
-        for text in stream.text_stream:
-            full_text += text
-
-    raw = clean_json_response(full_text)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        raise
+    )
+    return json.loads(clean_json_response(response.content[0].text))
 
 
 CONTRACT_HEADER_PROMPT = """
@@ -229,26 +214,23 @@ Rules:
 
 
 def stream_claude(system_prompt, user_message, max_tokens=8000, label=""):
-    """Single streaming Claude call, returns cleaned text."""
+    """Plain (non-streaming) Claude call. Returns cleaned JSON text."""
     import sys
-    full_text = ""
     try:
-        with client.beta.messages.stream(
+        response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
-            betas=["output-128k-2025-02-19"],
-        ) as stream:
-            for text in stream.text_stream:
-                full_text += text
-        print(f"[{label}] Claude returned {len(full_text)} chars", flush=True, file=sys.stderr)
-        if not full_text.strip():
-            print(f"[{label}] WARNING: empty response from Claude", flush=True, file=sys.stderr)
+        )
+        text = response.content[0].text if response.content else ""
+        print(f"[{label}] Claude returned {len(text)} chars, stop_reason={response.stop_reason}", flush=True, file=sys.stderr)
+        if not text.strip():
+            print(f"[{label}] WARNING: empty response. stop_reason={response.stop_reason}", flush=True, file=sys.stderr)
+        return clean_json_response(text)
     except Exception as e:
-        print(f"[{label}] ERROR calling Claude: {e}", flush=True, file=sys.stderr)
+        print(f"[{label}] ERROR: {e}", flush=True, file=sys.stderr)
         raise
-    return clean_json_response(full_text)
 
 
 def call_claude_split(system_prompt, user_message, is_promotion=False):
