@@ -31,8 +31,10 @@ def extract_text_from_pdf(pdf_file):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
     for page in doc:
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        images.append(base64.standard_b64encode(pix.tobytes("png")).decode("utf-8"))
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        # Use JPEG at 85% quality — much smaller than PNG, still readable by Claude
+        img_bytes = pix.tobytes("jpeg", jpg_quality=85)
+        images.append(base64.standard_b64encode(img_bytes).decode("utf-8"))
     doc.close()
     return None, images
 
@@ -40,7 +42,7 @@ def extract_text_from_pdf(pdf_file):
 def build_claude_message(text, images, instruction):
     if text:
         return [{"type": "text", "text": f"{instruction}\n\n{text}"}]
-    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}} for img in images]
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}} for img in images]
     content.append({"type": "text", "text": instruction})
     return content
 
