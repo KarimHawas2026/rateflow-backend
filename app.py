@@ -57,34 +57,23 @@ def clean_json_response(text):
 
 def call_claude(system_prompt, user_message):
     """
-    Call Claude with extended output enabled (up to 64k tokens).
-    Falls back to a repair call if the JSON is truncated.
+    Call Claude using streaming so the connection stays alive and
+    Railway doesn't cut it off mid-response. Collects the full
+    streamed text then parses JSON once complete.
     """
-    response = client.beta.messages.create(
+    full_text = ""
+    with client.beta.messages.stream(
         model="claude-sonnet-4-6",
         max_tokens=16000,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
         betas=["output-128k-2025-02-19"],
-    )
-    raw = clean_json_response(response.content[0].text)
+    ) as stream:
+        for text in stream.text_stream:
+            full_text += text
 
-    # Try parsing — if it fails due to truncation, ask Claude to complete it
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Ask Claude to complete the truncated JSON
-        repair_response = client.beta.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=16000,
-            system="You are a JSON repair assistant. The user will give you a truncated JSON object. Complete it so it is valid JSON. Return ONLY the completed JSON, nothing else.",
-            messages=[
-                {"role": "user", "content": f"This JSON was truncated, please complete it:\n\n{raw}"}
-            ],
-            betas=["output-128k-2025-02-19"],
-        )
-        repaired = clean_json_response(repair_response.content[0].text)
-        return json.loads(repaired)
+    raw = clean_json_response(full_text)
+    return json.loads(raw)
 
 
 def parse_date(date_str):
