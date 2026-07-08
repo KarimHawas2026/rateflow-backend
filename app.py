@@ -228,18 +228,26 @@ Rules:
 """
 
 
-def stream_claude(system_prompt, user_message, max_tokens=8000):
-    """Single streaming Claude call, returns parsed text."""
+def stream_claude(system_prompt, user_message, max_tokens=8000, label=""):
+    """Single streaming Claude call, returns cleaned text."""
+    import sys
     full_text = ""
-    with client.beta.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-        betas=["output-128k-2025-02-19"],
-    ) as stream:
-        for text in stream.text_stream:
-            full_text += text
+    try:
+        with client.beta.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+            betas=["output-128k-2025-02-19"],
+        ) as stream:
+            for text in stream.text_stream:
+                full_text += text
+        print(f"[{label}] Claude returned {len(full_text)} chars", flush=True, file=sys.stderr)
+        if not full_text.strip():
+            print(f"[{label}] WARNING: empty response from Claude", flush=True, file=sys.stderr)
+    except Exception as e:
+        print(f"[{label}] ERROR calling Claude: {e}", flush=True, file=sys.stderr)
+        raise
     return clean_json_response(full_text)
 
 
@@ -249,11 +257,16 @@ def call_claude_split(system_prompt, user_message, is_promotion=False):
     Each call has its own clean focused system prompt.
     """
     if is_promotion:
-        header_raw = stream_claude(PROMOTION_HEADER_PROMPT, user_message, max_tokens=4000)
-        seasons_raw = stream_claude(PROMOTION_SEASONS_PROMPT, user_message, max_tokens=16000)
+        header_raw = stream_claude(PROMOTION_HEADER_PROMPT, user_message, max_tokens=4000, label="PROMO_HEADER")
+        seasons_raw = stream_claude(PROMOTION_SEASONS_PROMPT, user_message, max_tokens=16000, label="PROMO_SEASONS")
     else:
-        header_raw = stream_claude(CONTRACT_HEADER_PROMPT, user_message, max_tokens=4000)
-        seasons_raw = stream_claude(CONTRACT_SEASONS_PROMPT, user_message, max_tokens=16000)
+        header_raw = stream_claude(CONTRACT_HEADER_PROMPT, user_message, max_tokens=4000, label="CONTRACT_HEADER")
+        seasons_raw = stream_claude(CONTRACT_SEASONS_PROMPT, user_message, max_tokens=16000, label="CONTRACT_SEASONS")
+
+    if not header_raw.strip():
+        raise ValueError("Claude returned empty response for header extraction")
+    if not seasons_raw.strip():
+        raise ValueError("Claude returned empty response for seasons extraction")
 
     header_data = json.loads(header_raw)
 
@@ -788,11 +801,15 @@ def process_pdfs():
         return jsonify(result)
 
     except json.JSONDecodeError as e:
-        raw = raw_contract or raw_promotion or "unavailable"
-        return jsonify({"error": f"Failed to parse Claude response: {str(e)}", "raw_response": raw[:2000] if isinstance(raw, str) else str(raw)[:2000]}), 500
+        import traceback, sys
+        tb = traceback.format_exc()
+        print(f"JSON parse error: {e}\n{tb}", file=sys.stderr, flush=True)
+        return jsonify({"error": f"Failed to parse Claude response: {str(e)}", "trace": tb[-2000:]}), 500
     except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()[-1500:]}), 500
+        import traceback, sys
+        tb = traceback.format_exc()
+        print(f"Unhandled error: {e}\n{tb}", file=sys.stderr, flush=True)
+        return jsonify({"error": str(e), "trace": tb[-2000:]}), 500
 
 
 @app.route("/health", methods=["GET"])
