@@ -30,9 +30,13 @@ def extract_text_from_pdf(pdf_file):
         return text, None
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
-    for page in doc:
+    # Rate tables and policies are always in the first few pages.
+    # Cap at 8 pages to keep the upload under Railway's proxy size limit.
+    MAX_PAGES = 8
+    for i, page in enumerate(doc):
+        if i >= MAX_PAGES:
+            break
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        # Use JPEG at 85% quality — much smaller than PNG, still readable by Claude
         img_bytes = pix.tobytes("jpeg", jpg_quality=85)
         images.append(base64.standard_b64encode(img_bytes).decode("utf-8"))
     doc.close()
