@@ -12,6 +12,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, origins="*")
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -728,11 +729,19 @@ def process_pdfs():
     raw_contract = None
     raw_promotion = None
     try:
-        contract_file = request.files.get("contract")
-        promotion_file = request.files.get("promotion")
-
-        if not contract_file:
-            return jsonify({"error": "Contract PDF is required"}), 400
+        # Accept JSON with base64-encoded PDFs to bypass Railway proxy size limit,
+        # or multipart/form-data for smaller files.
+        if request.content_type and "application/json" in request.content_type:
+            body = request.get_json(force=True)
+            if not body or not body.get("contract"):
+                return jsonify({"error": "Contract PDF is required"}), 400
+            contract_file = io.BytesIO(base64.b64decode(body["contract"]))
+            promotion_file = io.BytesIO(base64.b64decode(body["promotion"])) if body.get("promotion") else None
+        else:
+            contract_file = request.files.get("contract")
+            promotion_file = request.files.get("promotion")
+            if not contract_file:
+                return jsonify({"error": "Contract PDF is required"}), 400
 
         contract_text, contract_images = extract_text_from_pdf(contract_file)
 
