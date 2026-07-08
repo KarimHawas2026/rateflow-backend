@@ -59,9 +59,11 @@ def clean_json_response(text):
 
 def call_claude(system_prompt, user_message):
     """
-    Call Claude using streaming so the connection stays alive and
-    Railway doesn't cut it off mid-response. Collects the full
-    streamed text then parses JSON once complete.
+    Call Claude using streaming. For large contracts the JSON can still
+    exceed token limits, so we use a two-pass approach:
+    Pass 1: extract everything EXCEPT room_seasons
+    Pass 2: extract room_seasons only
+    Then merge.
     """
     full_text = ""
     with client.beta.messages.stream(
@@ -75,7 +77,132 @@ def call_claude(system_prompt, user_message):
             full_text += text
 
     raw = clean_json_response(full_text)
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise
+
+
+def call_claude_split(system_prompt, user_message, is_promotion=False):
+    """
+    Two-pass extraction for large contracts/promotions:
+    Pass 1 gets hotel info + policy + supplements (small)
+    Pass 2 gets room_seasons only (focused, handles many rows)
+    """
+    PASS1_SYSTEM = system_prompt + """
+
+IMPORTANT FOR THIS CALL: Return ONLY the header fields — do NOT include room_seasons.
+Return this structure only (no room_seasons key):
+{
+  "hotel_name": "...",
+  "reservation_date_from": "DD/MM/YYYY",
+  "reservation_date_till": "DD/MM/YYYY",
+  "meal_plans": [...],
+  "supplement_rules": {...},
+  "occupancy_policy": {...}
+}
+"""
+
+    if is_promotion:
+        PASS1_SYSTEM = system_prompt + """
+
+IMPORTANT FOR THIS CALL: Return ONLY the header fields — do NOT include room_seasons.
+Return this structure only (no room_seasons key):
+{
+  "hotel_name": "...",
+  "promo_code": "...",
+  "reservation_date_from": "DD/MM/YYYY",
+  "reservation_date_till": "DD/MM/YYYY",
+  "mlos": 1,
+  "mlos_till": 366,
+  "meal_plans": [...],
+  "supplement_rules": {...},
+  "occupancy_policy": {...}
+}
+"""
+        PASS2_SYSTEM = """You are a hotel rate extraction expert. Extract ONLY the room_seasons array from this promotion.
+Return ONLY a JSON array:
+[
+  {
+    "room": "string",
+    "base_rate": 0,
+    "meal_plan": "Bed and Breakfast",
+    "season_begin": "DD/MM/YYYY",
+    "season_end": "DD/MM/YYYY",
+    "season_type": "Low",
+    "res_date_from": "DD/MM/YYYY",
+    "res_date_till": "DD/MM/YYYY"
+  }
+]
+Rules:
+- base_rate = the final discounted promo rate (not the contracted rate)
+- One entry per room type per date row in the promotion table
+- meal_plan = the meal plan the rate is quoted at
+- season_type: exactly "Low", "Shoulder", "High", or "Peak" (Festive/F = "Peak")
+- res_date_from/till = the promotion booking window dates (same for all entries)
+- All dates DD/MM/YYYY
+- Return ONLY the raw JSON array, no markdown, no explanation
+"""
+    else:
+        PASS2_SYSTEM = """You are a hotel rate extraction expert. Extract ONLY the room_seasons array from this hotel contract.
+Return ONLY a JSON array:
+[
+  {
+    "room": "string",
+    "base_bb": 0,
+    "season_begin": "DD/MM/YYYY",
+    "season_end": "DD/MM/YYYY",
+    "season_type": "High",
+    "res_date_from": "DD/MM/YYYY",
+    "res_date_till": "DD/MM/YYYY"
+  }
+]
+Rules:
+- base_bb = Double Occupancy (2A) BB rate per room per night
+- If rates show per-occupancy columns (1A, 2A etc), use the 2A column
+- One entry per room type per season date range
+- season_type: exactly "Low", "Shoulder", "High", or "Peak" (Festive/F = "Peak")
+- res_date_from = contract start date (same for all entries)
+- res_date_till = contract end date (same for all entries, NOT the season end date)
+- All dates DD/MM/YYYY
+- Return ONLY the raw JSON array, no markdown, no explanation
+"""
+
+    # Pass 1 — header/policy
+    header_text = ""
+    with client.beta.messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=4000,
+        system=PASS1_SYSTEM,
+        messages=[{"role": "user", "content": user_message}],
+        betas=["output-128k-2025-02-19"],
+    ) as stream:
+        for text in stream.text_stream:
+            header_text += text
+
+    header_data = json.loads(clean_json_response(header_text))
+
+    # Pass 2 — room seasons only
+    seasons_text = ""
+    with client.beta.messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=16000,
+        system=PASS2_SYSTEM,
+        messages=[{"role": "user", "content": user_message}],
+        betas=["output-128k-2025-02-19"],
+    ) as stream:
+        for text in stream.text_stream:
+            seasons_text += text
+
+    raw_seasons = clean_json_response(seasons_text)
+    if raw_seasons.strip().startswith("["):
+        seasons = json.loads(raw_seasons)
+    else:
+        wrapped = json.loads(raw_seasons)
+        seasons = wrapped.get("room_seasons", list(wrapped.values())[0] if wrapped else [])
+
+    header_data["room_seasons"] = seasons
+    return header_data
 
 
 def parse_date(date_str):
@@ -547,7 +674,7 @@ def process_pdfs():
 
         contract_text, contract_images = extract_text_from_pdf(contract_file)
 
-        contract_data = call_claude(
+        contract_data = call_claude_split(
             CONTRACT_EXTRACTION_PROMPT,
             build_claude_message(contract_text, contract_images, "Extract all rate data from this hotel contract:")
         )
@@ -567,10 +694,11 @@ def process_pdfs():
             promotion_text, promotion_images = extract_text_from_pdf(promotion_file)
             context_note = ("\n\nCONTRACT CONTEXT (use for supplement rules and child policy if not in promotion):\n" + contract_text) if contract_text else ""
 
-            promotion_data = call_claude(
+            promotion_data = call_claude_split(
                 PROMOTION_EXTRACTION_PROMPT,
                 build_claude_message(promotion_text, promotion_images,
-                    f"Extract all rate data from this promotion PDF.{context_note}")
+                    f"Extract all rate data from this promotion PDF.{context_note}"),
+                is_promotion=True
             )
             promotion_data = validate_dates(promotion_data)
 
